@@ -109,9 +109,7 @@ conversation_states = {}
 async def handle_media_stream(websocket: WebSocket):
 
     logger.info("WebSocket connection attempt from Twilio.")
-
     try:
-        
         await websocket.accept(subprotocols=["stream"])
         logger.info("WebSocket connection successfully accepted.")
 
@@ -239,7 +237,7 @@ async def handle_media_stream(websocket: WebSocket):
         import traceback
         logger.error(traceback.format_exc())
 
-        
+
 async def initialize_session(openai_ws):
     """Initialize the OpenAI session with instructions and tools."""
     session_update = {
