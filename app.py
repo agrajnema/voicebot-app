@@ -268,17 +268,24 @@ async def handle_media_stream(websocket: WebSocket):
                                 if "would you like to receive the links by sms or email" in state.get("last_response", "").lower():
                                     state["waiting_for"] = "sms_or_email"
                                     logger.info("Setting state to waiting for SMS or Email selection")
-                                
+
                                 # Process different conversation states
                                 if state["waiting_for"] == "sms_or_email":
-                                    logger.info(f"Processing SMS/Email selection: '{user_input}'")
-                                    if any(word in user_input for word in ["sms", "text", "message", "txt"]):
+                                    logger.info(f"Processing SMS/Email selection from user input: '{user_input}'")
+                                    
+                                    # More aggressive pattern matching for SMS
+                                    sms_patterns = ["sms", "text", "message", "txt", "texting", "messaging", "s m s"]
+                                    email_patterns = ["email", "mail", "e-mail", "electronic", "e mail", "gmail"]
+                                    
+                                    if any(pattern in user_input for pattern in sms_patterns):
+                                        logger.info("SMS option selected")
                                         state["delivery_method"] = "sms"
                                         state["waiting_for"] = "mobile_collection"
                                         await inject_assistant_message(openai_ws, 
                                             "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
                                             "Please say your complete mobile number now.")
-                                    elif any(word in user_input for word in ["email", "mail", "e-mail", "electronic"]):
+                                    elif any(pattern in user_input for pattern in email_patterns):
+                                        logger.info("Email option selected")
                                         state["delivery_method"] = "email"
                                         state["waiting_for"] = "email_collection"
                                         await inject_assistant_message(openai_ws, 
@@ -288,7 +295,11 @@ async def handle_media_stream(websocket: WebSocket):
                                     elif any(word in user_input for word in ["neither", "none", "no", "cancel"]):
                                         state["waiting_for"] = None
                                         await inject_assistant_message(openai_ws, "No problem. Is there anything else I can help you with?")
-                                
+                                    else:
+                                        # If we can't determine the choice, ask again
+                                        await inject_assistant_message(openai_ws, 
+                                            "I'm sorry, I didn't catch if you wanted SMS or email. Please clearly say either 'SMS' or 'Email'.")
+                                                                
                                 # Handle email collection
                                 elif state["waiting_for"] == "email_collection":
                                     logger.info(f"Processing email input: '{user_input}'")
@@ -388,13 +399,12 @@ async def handle_media_stream(websocket: WebSocket):
                                         else:
                                             logger.error(f"Failed to send email to {email_address}")
                                             await inject_assistant_message(openai_ws, 
-                                                "I'm sorry, there was an issue sending the email. Let's continue with something else. What else can I help you with?")
+                                                f"I'm sorry, there was an issue sending the email to {email_address}. Let's continue with something else. What else can I help you with?")
                                     else:
                                         # Start over with email
                                         state["waiting_for"] = "email_collection"
                                         await inject_assistant_message(openai_ws, 
                                             "Let's try again. Please say your complete email address, saying 'at' for @ and 'dot' for period.")
-                                
                                 # Handle mobile confirmation
                                 elif state["waiting_for"] == "confirm_mobile":
                                     logger.info(f"Processing mobile confirmation: '{user_input}'")
@@ -403,17 +413,20 @@ async def handle_media_stream(websocket: WebSocket):
                                         if not mobile.startswith('+'):
                                             mobile = '+' + mobile
                                         
+                                        # Format the number in a readable way
+                                        formatted_mobile = ' '.join(mobile)
+                                        
                                         logger.info(f"Sending SMS to confirmed number: {mobile}")
                                         success = await send_sms(mobile, state["last_result"])
                                         state["waiting_for"] = None
                                         
                                         if success:
                                             await inject_assistant_message(openai_ws, 
-                                                f"Great! I've sent the information to your mobile. Is there anything else you need help with?")
+                                                f"Great! I've sent the information to your mobile number {formatted_mobile}. Is there anything else you need help with?")
                                         else:
                                             logger.error(f"Failed to send SMS to {mobile}")
                                             await inject_assistant_message(openai_ws, 
-                                                "I'm sorry, there was an issue sending the SMS. Let's continue with something else. What else can I help you with?")
+                                                f"I'm sorry, there was an issue sending the SMS to {formatted_mobile}. Let's continue with something else. What else can I help you with?")
                                     else:
                                         # Start over with mobile
                                         state["waiting_for"] = "mobile_collection"
