@@ -440,18 +440,23 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                                 if stream_sid and stream_sid in conversation_states:
                                     state = conversation_states[stream_sid]
-                                    state["last_response"] = full_response
                                     
-                                    # Save content for sending later via SMS or email
-                                    if "would you like to receive the links by sms or email" in full_response.lower():
-                                        state["last_result"] = full_response
-                                        state["waiting_for"] = "sms_or_email"
-                                        logger.info("Detected SMS/Email prompt - waiting for user selection")
-                                    
-                                    # Check for ending message and disconnect call
-                                    if "thanks for calling alinta energy" in full_response.lower():
-                                        logger.info("Detected call ending message, will terminate call")
-                                        asyncio.create_task(end_call_with_delay(call_sid, 2))
+                                    # Check and enforce proper SMS/Email selection flow
+                                    corrected = await enforce_sms_email_state(openai_ws, response, state)
+                                    if not corrected:
+                                        # Only update last_response if we didn't correct a premature selection
+                                        state["last_response"] = full_response
+                                        
+                                        # Save content for sending later via SMS or email
+                                        if "would you like to receive the links by sms or email" in full_response.lower():
+                                            state["last_result"] = full_response
+                                            state["waiting_for"] = "sms_or_email"
+                                            logger.info("Detected SMS/Email prompt - waiting for user selection")
+                                        
+                                        # Check for ending message and disconnect call
+                                        if "thanks for calling alinta energy" in full_response.lower():
+                                            logger.info("Detected call ending message, will terminate call")
+                                            asyncio.create_task(end_call_with_delay(call_sid, 2))
                             
                             # Handle audio response
                             elif response_type == "response.audio.delta" and "delta" in response:
@@ -694,12 +699,13 @@ async def initialize_session(openai_ws):
                 "1. ALWAYS START by saying exactly: 'Welcome to Alinta Energy. In a few words, please tell me the reason for your call.'\n\n"
                 "2. When the customer explains their reason for calling, provide a concise summary of what they're asking and then say 'Is that right?'\n\n"
                 "3. After the customer confirms, provide a brief response using information from the search function.\n\n"
-                "4. Then ALWAYS ask: 'To do this in a quick and easy way, would you like to receive the links by SMS or email?'\n\n"
-                "5. If they choose email, say: 'Please be advised that you would receive an email from Alinta energy from noreply@alintaenergy.com.au. You may also check your junk folder to look for the email. Please say your complete email address now, saying \"at\" for @ and \"dot\" for period.'\n\n"
-                "6. If they choose SMS, say: 'Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. Please say your complete mobile number now.'\n\n"
+                "4. Then ALWAYS ask EXACTLY: 'To do this in a quick and easy way, would you like to receive the links by SMS or email?' and STOP TALKING. Do not continue speaking until the customer responds with their preference.\n\n"
+                "5. ONLY AFTER the customer explicitly chooses email, say: 'Please be advised that you would receive an email from Alinta energy from noreply@alintaenergy.com.au. You may also check your junk folder to look for the email. Please say your complete email address now, saying \"at\" for @ and \"dot\" for period.'\n\n"
+                "6. ONLY AFTER the customer explicitly chooses SMS, say: 'Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. Please say your complete mobile number now.'\n\n"
                 "7. When ending the call, always say: 'Thanks for calling Alinta Energy.'\n\n"
                 "Keep all responses concise and straight to the point, not more than 30-50 words.\n"
-                "Use the get_additional_context function to retrieve information for customer queries."
+                "Use the get_additional_context function to retrieve information for customer queries.\n"
+                "CRITICAL: After asking if the customer wants SMS or email, you MUST wait for their explicit choice before continuing."
             ),
             "tools": [
                 {
@@ -713,6 +719,54 @@ async def initialize_session(openai_ws):
     }
     await openai_ws.send(json.dumps(session_update))
 
+# Add this as a separate function that gets called from your WebSocket handler
+
+async def enforce_sms_email_state(openai_ws, response, state):
+    """Ensures proper handling of SMS/Email selection flow"""
+    
+    # Check if the response contains both the question and a premature selection
+    full_response = response.get("text", "").lower()
+    
+    if ("would you like to receive the links by sms or email" in full_response and
+        ("please be advised that you would receive an email" in full_response or 
+         "please be advised that you would receive an sms" in full_response)):
+        
+        logger.warning("Detected premature SMS/Email selection in AI response")
+        
+        # Extract just the question part (up to the question mark)
+        question_part = full_response.split("?")[0] + "?"
+        
+        # Force the AI to stop and wait for user selection
+        try:
+            # Override the current response with just the question
+            corrected_message = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": question_part}]
+                }
+            }
+            
+            # Send the corrected message
+            await openai_ws.send(json.dumps(corrected_message))
+            
+            # Set the state to wait for SMS/Email selection
+            state["waiting_for"] = "sms_or_email"
+            state["last_response"] = question_part
+            
+            logger.info("Corrected premature selection, now waiting for user choice")
+            return True
+        except Exception as e:
+            logger.error(f"Error correcting premature selection: {e}")
+    
+    # If the response just contains the question (correct behavior)
+    elif "would you like to receive the links by sms or email" in full_response:
+        state["waiting_for"] = "sms_or_email"
+        state["last_response"] = full_response
+        logger.info("SMS/Email question detected, waiting for user selection")
+    
+    return False
 
 async def trigger_rag_search(openai_ws, query):
     """Trigger RAG search for a specific query."""
