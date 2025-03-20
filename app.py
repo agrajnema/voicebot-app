@@ -79,7 +79,6 @@ async def index_page():
 async def websocket_test():
     return {"websocket_supported": True, "message": "WebSocket endpoint is operational"}
 
-# 1. Fix for incoming call and beep issue
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     # Create TwiML response
@@ -90,19 +89,13 @@ async def handle_incoming_call(request: Request):
     call_sid = form_data.get('CallSid')
     logger.info(f"Incoming call with SID: {call_sid}")
     
-    # Initial greeting - keep this short
-    response.say("Welcome to Alinta Energy.")
-    
-    # Add a small pause
-    response.pause(length=0.5)
+    # Initial greeting with the specific welcome message
+    response.say("Welcome to Alinta Energy. In a few words, please tell me the reason for your call.")
     
     # Get the public-facing hostname
     host = request.headers.get("X-Forwarded-Host", request.url.hostname)
     if request.url.port and request.url.port != 443:
         host = f"{host}:{request.url.port}"
-    
-    # Log the host for debugging
-    logger.info(f"Using host for WebSocket connection: {host}")
     
     # Create the Connect verb with proper WebSocket URL
     connect = Connect()
@@ -112,18 +105,15 @@ async def handle_incoming_call(request: Request):
     # Add the connect element to the response
     response.append(connect)
     
-    # Play a DTMF tone (beep) AFTER the stream connection
-    # Using digit 1 with a pause
+    # Play a DTMF tone (beep)
     response.play(digits="1w")
-    
-    # Instruction to start talking after the beep
-    response.say("You can start talking now.")
     
     # Log the full TwiML for debugging
     logger.info(f"Generated TwiML response: {str(response)}")
     
     # Return the TwiML response
     return HTMLResponse(content=str(response), media_type="application/xml")
+
 
 # Add this to your global variables
 conversation_states = {}
@@ -139,10 +129,12 @@ async def handle_media_stream(websocket: WebSocket):
         stream_sid = None
         call_sid = None
         
-        # Initialize conversation state
+        # Initialize conversation state with flow tracking
         conversation_state = {
             "last_response": "",
             "waiting_for": None,
+            "flow_stage": "greeting",  # Track conversation stage
+            "intent_confirmed": False,
             "contact_info": None,
             "delivery_method": None,
             "email_chars": [],
@@ -177,9 +169,6 @@ async def handle_media_stream(websocket: WebSocket):
                 try:
                     async for message in websocket.iter_text():
                         try:
-                            # Debug log the raw message
-                            logger.debug(f"Raw message from Twilio: {message[:100]}...")
-                            
                             data = json.loads(message)
                             event_type = data.get("event")
                             logger.info(f"Received Twilio event: {event_type}")
@@ -244,35 +233,44 @@ async def handle_media_stream(websocket: WebSocket):
                                 state = conversation_states[stream_sid]
                                 state["last_query"] = user_input
                                 
-                                # Enhanced call end detection
+                                # Check for call end keywords in any context
                                 end_call_phrases = ["bye", "goodbye", "end", "hang up", "thank you bye", 
-                                                  "no thank you", "that's all", "thank you", "thanks bye"]
+                                                 "no thank you", "that's all", "that is all"]
                                 
                                 if any(phrase in user_input for phrase in end_call_phrases):
-                                    state["disconnect_attempts"] += 1
-                                    logger.info(f"End call keyword detected: '{user_input}', attempt {state['disconnect_attempts']}")
-                                    
-                                    if state["disconnect_attempts"] >= 1:
-                                        logger.info("Ending call due to goodbye detection")
-                                        await inject_assistant_message(openai_ws, "Thank you for calling Alinta Energy. Goodbye!")
-                                        
-                                        # End the call after a short delay
-                                        asyncio.create_task(end_call_with_delay(call_sid, 3))
+                                    logger.info(f"End call keyword detected: '{user_input}'")
+                                    await inject_assistant_message(openai_ws, "Thanks for calling Alinta Energy.")
+                                    # End the call after a short delay
+                                    asyncio.create_task(end_call_with_delay(call_sid, 2))
+                                    return
+                                
+                                # Handle "Is that right?" confirmation
+                                if "is that right" in state.get("last_response", "").lower() and not state["intent_confirmed"]:
+                                    if any(word in user_input for word in ["yes", "correct", "right", "yeah", "yep", "that's right"]):
+                                        state["intent_confirmed"] = True
+                                        logger.info("User confirmed intent")
+                                    elif any(word in user_input for word in ["no", "incorrect", "wrong", "not right"]):
+                                        await inject_assistant_message(openai_ws, "I apologize for misunderstanding. Could you please explain again what you're looking for?")
+                                
+                                # Handle SMS or Email selection
+                                if "would you like to receive the links by sms or email" in state.get("last_response", "").lower():
+                                    state["waiting_for"] = "sms_or_email"
                                 
                                 # Process conversation states for email/SMS collection
                                 if state["waiting_for"] == "sms_or_email":
                                     if any(word in user_input for word in ["sms", "text", "message", "txt"]):
                                         state["delivery_method"] = "sms"
                                         state["waiting_for"] = "mobile"
-                                        state["mobile_digits"] = []
                                         await inject_assistant_message(openai_ws, 
-                                            "I'll need your mobile number. Please say each digit one at a time, and I'll confirm each digit.")
+                                            "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
+                                            "Please tell me your mobile number one digit at a time, and I'll confirm each digit.")
                                     elif any(word in user_input for word in ["email", "mail", "e-mail", "electronic"]):
                                         state["delivery_method"] = "email"
                                         state["waiting_for"] = "email_chars"
-                                        state["email_chars"] = []
                                         await inject_assistant_message(openai_ws, 
-                                            "I'll need your email address. Please spell out your email one character at a time. "
+                                            "Please be advised that you would receive an email from Alinta energy from noreply@alintaenergy.com.au. "
+                                            "You may also check your junk folder to look for the email. "
+                                            "Please spell out your email one character at a time. "
                                             "Say 'at' for @, 'dot' for period, and I'll confirm each character.")
                                     elif any(word in user_input for word in ["neither", "none", "no", "cancel"]):
                                         state["waiting_for"] = None
@@ -372,7 +370,7 @@ async def handle_media_stream(websocket: WebSocket):
                                         
                                         if success:
                                             await inject_assistant_message(openai_ws, 
-                                                f"Great! I've sent the information to your mobile. Is there anything else you need help with?")
+                                                "Great! I've sent the information to your mobile. Is there anything else you need help with?")
                                         else:
                                             await inject_assistant_message(openai_ws, 
                                                 "I'm sorry, there was an issue sending the SMS. Let's continue with something else. What else can I help you with?")
@@ -409,12 +407,18 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                                 if stream_sid and stream_sid in conversation_states:
                                     state = conversation_states[stream_sid]
-                                    state["last_result"] = full_response
+                                    state["last_response"] = full_response
                                     
-                                    # If the AI asked about SMS or Email, update state
-                                    if "sms or email" in full_response.lower():
+                                    # Save content for sending later
+                                    if "would you like to receive the links by sms or email" in full_response.lower():
+                                        state["last_result"] = full_response
                                         state["waiting_for"] = "sms_or_email"
                                         logger.info("Detected SMS/Email prompt - waiting for user selection")
+                                    
+                                    # Check for ending message and disconnect call
+                                    if "thanks for calling alinta energy" in full_response.lower():
+                                        logger.info("Detected call ending message, will terminate call")
+                                        asyncio.create_task(end_call_with_delay(call_sid, 2))
                             
                             # Handle audio response
                             elif response_type == "response.audio.delta" and "delta" in response:
@@ -558,6 +562,7 @@ def verify_twilio_setup():
         logger.error(f"Twilio setup verification failed: {str(e)}")
         return False
 
+# Helper functions
 def spell_out_email(email):
     """Spell out an email address for clearer voice confirmation"""
     result = ""
@@ -593,7 +598,7 @@ async def end_call(call_sid):
         logger.error(traceback.format_exc())
 
 # Add function to end call after a delay
-async def end_call_with_delay(call_sid, delay_seconds=3):
+async def end_call_with_delay(call_sid, delay_seconds=2):
     """End the call after a delay to allow for goodbye message"""
     if not call_sid:
         logger.error("No call_sid available for ending call")
@@ -604,21 +609,38 @@ async def end_call_with_delay(call_sid, delay_seconds=3):
     
     try:
         # Use Twilio client to end the call
+        logger.info(f"Attempting to end call {call_sid}")
         twilio_client.calls(call_sid).update(status="completed")
         logger.info(f"Call {call_sid} has been ended")
     except Exception as e:
-        logger.error(f"Error ending call: {e}")
+        logger.error(f"Error ending call with Twilio client: {e}")
         
         # Fallback: Try direct API call
         try:
             import requests
+            logger.info(f"Attempting fallback method to end call {call_sid}")
             url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json"
             data = {"Status": "completed"}
             response = requests.post(url, data=data, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-            logger.info(f"Fallback call termination result: {response.status_code}")
+            logger.info(f"Fallback call termination result: {response.status_code}, {response.text}")
         except Exception as e2:
             logger.error(f"Fallback call termination also failed: {e2}")
-
+            
+        # Last resort: Try webhook approach
+        try:
+            logger.info(f"Attempting last resort method to end call {call_sid}")
+            # This creates a TwiML that hangs up the call
+            hangup_response = VoiceResponse()
+            hangup_response.hangup()
+            
+            # Send this to Twilio via their API
+            url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json"
+            data = {"Twiml": str(hangup_response)}
+            response = requests.post(url, data=data, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+            logger.info(f"Last resort call termination result: {response.status_code}, {response.text}")
+        except Exception as e3:
+            logger.error(f"All call termination methods failed: {e3}")
+            
 async def initialize_session(openai_ws):
     """Initialize the OpenAI session with instructions and tools."""
     session_update = {
@@ -629,17 +651,15 @@ async def initialize_session(openai_ws):
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
             "instructions": (
-                "You are an AI assistant providing factual answers from the search. "
-                "When responding to a user query, first briefly reiterate what they asked, then provide your answer clearly. "
-                "If USER says hello Always respond with with Hello, I am Jason from Alinta Energy. How can I help you today? "
-                "Use the `get_additional_context` function to retrieve relevant information. "
-                "Keep all your responses concise and straight to the point, not more than 30-50 words. "
-                "After providing any information, always ask: 'Would you like to receive this information via SMS or Email?' "
-                "If they choose SMS, ask for their mobile number. "
-                "If they choose Email, collect the email character by character. "
-                "Once they provide these details, confirm you are sending the information and continue the conversation. "
-                "If USER says Thank You, Always respond with 'You are welcome, Is there anything else I can help you with?' "
-                "When the user says goodbye or indicates they want to end the call, thank them for calling and say goodbye."
+                "You are Jason from Alinta Energy providing customer support. Follow this exact conversation flow:\n\n"
+                "1. When the customer explains their reason for calling, provide a concise summary of what they're asking and then say 'Is that right?'\n\n"
+                "2. After the customer confirms, provide a brief response using information from the search function.\n\n"
+                "3. Then ALWAYS ask: 'To do this in a quick and easy way, would you like to receive the links by SMS or email?'\n\n"
+                "4. If they choose email, say: 'Please be advised that you would receive an email from Alinta energy from noreply@alintaenergy.com.au. You may also check your junk folder to look for the email.'\n\n"
+                "5. If they choose SMS, say: 'Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000.'\n\n"
+                "6. When ending the call, always say: 'Thanks for calling Alinta Energy.'\n\n"
+                "Keep all responses concise and straight to the point, not more than 30-50 words.\n"
+                "Use the get_additional_context function to retrieve information for customer queries."
             ),
             "tools": [
                 {
