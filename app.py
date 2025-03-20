@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 import smtplib
 from email.message import EmailMessage
 from twilio.rest import Client
+import re
 
 load_dotenv()
 
@@ -85,20 +86,19 @@ async def handle_incoming_call(request: Request):
     response.say("Please wait while we connect your call.")
     response.pause(length=1)
     
-    # Get the public-facing hostname (may be different from the internal one)
-    # This is critical for Azure Web Apps
+    # Add a beep sound to indicate when the user should start speaking
+    response.play("https://api.twilio.com/cowbell.mp3")  # Use Twilio's standard tone
+    response.say("Please speak after the beep.")
+    
+    # Get the public-facing hostname
     host = request.headers.get("X-Forwarded-Host", request.url.hostname)
     
-    # Force secure connection
+    # Set up the WebSocket connection
     connect = Connect()
-    
-    # Use explicit URL with proper protocol
     ws_url = f"wss://{host}/media-stream"
     logger.info(f"Setting up Twilio stream connection to: {ws_url}")
-    
     connect.stream(url=ws_url)
     response.append(connect)
-    response.say("You can start talking now!")
     
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -109,33 +109,32 @@ conversation_states = {}
 async def handle_media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt from Twilio.")
     try:
-        # Accept the WebSocket connection from Twilio
         await websocket.accept()
         logger.info("WebSocket connection successfully accepted.")
 
         stream_sid = None
+        call_active = True  # Flag to track if call should remain active
         
         # Initialize conversation state
         conversation_state = {
             "last_response": "",
-            "waiting_for": None,  # Could be "sms_or_email", "mobile", "email"
+            "waiting_for": None,
             "contact_info": None,
             "delivery_method": None
         }
 
-        # The issue is with the additional_headers parameter - fix the connection to OpenAI
         # Create proper headers for the websocket connection
         headers = {"api-key": AZURE_OPENAI_API_KEY}
         
         # Connect to OpenAI API with proper headers
         async with websockets.connect(
             AZURE_OPENAI_API_ENDPOINT,
-            extra_headers=headers  # Use extra_headers instead of additional_headers
+            extra_headers=headers
         ) as openai_ws:
             await initialize_session(openai_ws)
 
             async def receive_from_twilio():
-                nonlocal stream_sid
+                nonlocal stream_sid, call_active
                 try:
                     async for message in websocket.iter_text():
                         data = json.loads(message)
@@ -154,8 +153,6 @@ async def handle_media_stream(websocket: WebSocket):
                                 conversation_states[stream_sid] = conversation_state
                 except WebSocketDisconnect:
                     logger.warning("WebSocket disconnected by client.")
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error from Twilio message: {e}")
                 except Exception as e:
                     logger.error(f"Error in receive_from_twilio: {str(e)}")
                 finally:
@@ -163,6 +160,7 @@ async def handle_media_stream(websocket: WebSocket):
                         del conversation_states[stream_sid]
 
             async def send_to_twilio():
+                nonlocal call_active
                 try:
                     async for openai_message in openai_ws:
                         response = json.loads(openai_message)
@@ -171,6 +169,15 @@ async def handle_media_stream(websocket: WebSocket):
                         if response.get("type") == "input_audio_buffer.committed":
                             user_input = response.get("text", "").strip().lower()
                             logger.info(f"User input committed: {user_input}")
+                            
+                            # Check for call end keywords
+                            if "goodbye" in user_input or "bye" in user_input or "end call" in user_input or "hang up" in user_input:
+                                logger.info("End call keyword detected")
+                                call_active = False
+                                await inject_assistant_message(openai_ws, "Thank you for calling Alinta Energy. Goodbye!")
+                                
+                                # End the call after a short delay to let the goodbye message play
+                                asyncio.create_task(end_call_after_delay(stream_sid, 5))
                             
                             # Process based on conversation state
                             if stream_sid and stream_sid in conversation_states:
@@ -188,15 +195,27 @@ async def handle_media_stream(websocket: WebSocket):
                                 # Check for mobile number or email input
                                 elif state["waiting_for"] == "mobile" and any(char.isdigit() for char in user_input):
                                     state["contact_info"] = user_input.replace(" ", "")
-                                    await send_sms(state["contact_info"], state["last_response"])
+                                    success = await send_sms(state["contact_info"], state["last_response"])
                                     state["waiting_for"] = None
-                                    await inject_assistant_message(openai_ws, "I've sent the information to your mobile number. Is there anything else you need help with?")
+                                    
+                                    if success:
+                                        await inject_assistant_message(openai_ws, "I've sent the information to your mobile number. Is there anything else you need help with?")
+                                    else:
+                                        await inject_assistant_message(openai_ws, "I'm sorry, there was an issue sending the SMS. Would you like to try again with a different number?")
                                     
                                 elif state["waiting_for"] == "email" and "@" in user_input:
-                                    state["contact_info"] = user_input.replace(" ", "")
-                                    await send_email(state["contact_info"], "Information from Alinta Energy", state["last_response"])
+                                    # Extract email more carefully from speech recognition
+                                    email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_input)
+                                    email = email_match.group(0) if email_match else user_input.replace(" ", "")
+                                    
+                                    state["contact_info"] = email
+                                    success = await send_email(state["contact_info"], "Information from Alinta Energy", state["last_response"])
                                     state["waiting_for"] = None
-                                    await inject_assistant_message(openai_ws, "I've sent the information to your email address. Is there anything else you need help with?")
+                                    
+                                    if success:
+                                        await inject_assistant_message(openai_ws, "I've sent the information to your email address. Is there anything else you need help with?")
+                                    else:
+                                        await inject_assistant_message(openai_ws, "I'm sorry, there was an issue sending the email. Would you like to try again with a different email address?")
 
                         # Handle AI response for detecting SMS/Email prompt
                         if response.get("type") == "response.text.done":
@@ -245,6 +264,25 @@ async def handle_media_stream(websocket: WebSocket):
         import traceback
         logger.error(traceback.format_exc())
 
+# Add function to end call after a delay
+async def end_call_after_delay(stream_sid, delay_seconds):
+    """End the call after a specified delay to allow goodbye message to play"""
+    try:
+        logger.info(f"Will end call with SID {stream_sid} after {delay_seconds} seconds")
+        await asyncio.sleep(delay_seconds)
+        
+        # Get the call SID associated with this stream
+        # Note: You may need to store a mapping between stream_sid and call_sid
+        call_sid = stream_sid.split('.')[0] if stream_sid and '.' in stream_sid else None
+        
+        if call_sid:
+            # End the call using Twilio's API
+            twilio_client.calls(call_sid).update(status="completed")
+            logger.info(f"Call with SID {call_sid} has been ended")
+        else:
+            logger.error(f"Could not extract call SID from stream SID: {stream_sid}")
+    except Exception as e:
+        logger.error(f"Error ending call: {e}")
 
 async def initialize_session(openai_ws):
     """Initialize the OpenAI session with instructions and tools."""
@@ -367,25 +405,54 @@ async def send_sms(phone_number, message):
         logger.error(f"Error sending SMS: {e}")
         return False
 
+# Enhance the email sending function with better error handling
 async def send_email(email_address, subject, message):
-    """Send email using SMTP."""
+    """Send email using SMTP with improved error handling."""
     try:
+        logger.info(f"Attempting to send email to {email_address}")
+        
+        # Basic email validation
+        if not re.match(r'[\w\.-]+@[\w\.-]+\.\w+', email_address):
+            logger.error(f"Invalid email format: {email_address}")
+            return False
+            
         msg = EmailMessage()
         msg.set_content(message)
         msg['Subject'] = subject
         msg['From'] = EMAIL_FROM
         msg['To'] = email_address
         
-        server = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+        # Connect with timeout
+        logger.debug(f"Connecting to SMTP server: {EMAIL_HOST}:{EMAIL_PORT}")
+        server = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=10)
+        
+        # Detailed logging for troubleshooting
+        server.set_debuglevel(1)
+        
+        # Start TLS
         server.starttls()
+        logger.debug("STARTTLS initiated")
+        
+        # Login
         server.login(EMAIL_USER, EMAIL_PASSWORD)
+        logger.debug("SMTP login successful")
+        
+        # Send message
         server.send_message(msg)
+        logger.debug("Message sent")
+        
+        # Quit properly
         server.quit()
         
-        logger.info(f"Email sent to {email_address}")
+        logger.info(f"Email successfully sent to {email_address}")
         return True
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error sending email: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Error sending email: {e}")
+        logger.error(f"Unexpected error sending email: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 if __name__ == "__main__":
