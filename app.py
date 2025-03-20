@@ -75,20 +75,30 @@ async def index_page():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming Twilio calls and set up the Media Stream"""
-    form_data = await request.form()
-    call_sid = form_data.get("CallSid")
+    call_sid = None
+    try:
+        # Try to parse form data
+        form_data = await request.form()
+        call_sid = form_data.get("CallSid")
+    except RuntimeError as e:
+        # Handle case where python-multipart is not installed
+        logger.error(f"Form parsing error: {e}")
+        # Continue without form data
+    except Exception as e:
+        logger.error(f"Unexpected error parsing form: {e}")
     
-    logger.info(f"Incoming call received with SID: {call_sid}")
+    logger.info(f"Incoming call received with SID: {call_sid or 'unknown'}")
     
-    # Initialize call state
-    active_calls[call_sid] = {
-        "last_response": "",
-        "waiting_for": None,  # Could be "sms_or_email", "mobile", "email"
-        "contact_info": None,
-        "delivery_method": None,
-        "transcript": "",
-        "last_query": ""
-    }
+    # Initialize call state if we have a call_sid
+    if call_sid:
+        active_calls[call_sid] = {
+            "last_response": "",
+            "waiting_for": None,
+            "contact_info": None,
+            "delivery_method": None,
+            "transcript": "",
+            "last_query": ""
+        }
     
     response = VoiceResponse()
     response.say("Please wait while we connect your call.")
