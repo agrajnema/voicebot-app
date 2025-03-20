@@ -1,20 +1,21 @@
 import os
 import json
 import base64
-import asyncio
-import websockets
 import logging
-from fastapi import FastAPI, WebSocket, Request
+import asyncio
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.websockets import WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
-from dotenv import load_dotenv
-
+from twilio.rest import Client
 import smtplib
 from email.message import EmailMessage
-from twilio.rest import Client
+from dotenv import load_dotenv
+import requests
+import io
+import time
 
 load_dotenv()
 
@@ -37,16 +38,15 @@ EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 
-
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Twilio Client Setup
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Azure Search Client Setup
 credential = AzureKeyCredential(AZURE_SEARCH_KEY)
@@ -57,10 +57,6 @@ search_client = SearchClient(
 # FastAPI App
 app = FastAPI()
 
-# At the top of your file, add:
-from fastapi.middleware.cors import CORSMiddleware
-
-# After creating your FastAPI app:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -69,236 +65,225 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Active call tracking
+active_calls = {}
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
-    return {"message": "Application is running!"}
-
-
-@app.get("/websocket-test")
-async def websocket_test():
-    return {"websocket_supported": True, "message": "WebSocket endpoint is operational"}
-
+    return {"message": "Twilio Media Streams REST API Application is running!"}
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
+    """Handle incoming Twilio calls and set up the Media Stream"""
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid")
+    
+    logger.info(f"Incoming call received with SID: {call_sid}")
+    
+    # Initialize call state
+    active_calls[call_sid] = {
+        "last_response": "",
+        "waiting_for": None,  # Could be "sms_or_email", "mobile", "email"
+        "contact_info": None,
+        "delivery_method": None,
+        "transcript": "",
+        "last_query": ""
+    }
+    
     response = VoiceResponse()
     response.say("Please wait while we connect your call.")
     response.pause(length=1)
     
-    # Get the public-facing hostname (may be different from the internal one)
-    # This is critical for Azure Web Apps
-    host = request.headers.get("X-Forwarded-Host", request.url.hostname)
-    
-    # Force secure connection
+    # Use MediaStream with a REST endpoint
     connect = Connect()
+    media = connect.stream(name='Alinta Energy Voice Bot')
     
-    # Use explicit URL with proper protocol
-    ws_url = f"wss://{host}/media-stream"
-    logger.info(f"Setting up Twilio stream connection to: {ws_url}")
+    # Set stream parameters
+    media.parameter(name="contentType", value="audio/x-mulaw")
     
-    connect.stream(url=ws_url)
+    # Set callback URLs
+    host = request.headers.get("X-Forwarded-Host", request.url.hostname)
+    protocol = request.headers.get("X-Forwarded-Proto", "https")
+    base_url = f"{protocol}://{host}"
+    
+    media.parameter(name="statusCallback", value=f"{base_url}/stream-status")
+    media.parameter(name="track", value="inbound_track")
+    media.parameter(name="url", value=f"{base_url}/media-stream")
+    
     response.append(connect)
     response.say("You can start talking now!")
     
     return HTMLResponse(content=str(response), media_type="application/xml")
 
-# Add this to your global variables
-conversation_states = {}
+@app.post("/stream-status")
+async def stream_status(request: Request):
+    """Handle Media Stream status callbacks"""
+    form_data = await request.form()
+    logger.info(f"Stream status callback: {form_data}")
+    return {"status": "ok"}
 
-@app.websocket("/media-stream")
-async def handle_media_stream(websocket: WebSocket):
+@app.post("/media-stream")
+async def handle_media_stream(request: Request, background_tasks: BackgroundTasks):
+    """Handle incoming media chunks"""
+    # Extract headers for call identification
+    call_sid = request.headers.get("X-Twilio-CallSid")
+    if not call_sid:
+        logger.error("No Call SID provided in media stream request")
+        return {"status": "error", "message": "No Call SID provided"}
+    
+    # Get the audio data
+    audio_data = await request.body()
+    
+    # Process in background to avoid blocking
+    background_tasks.add_task(
+        process_audio_chunk, 
+        call_sid=call_sid, 
+        audio_data=audio_data
+    )
+    
+    return {"status": "processing"}
 
-    logger.info("WebSocket connection attempt from Twilio.")
+async def process_audio_chunk(call_sid: str, audio_data: bytes):
+    """Process audio chunks and interact with Azure OpenAI API"""
+    if call_sid not in active_calls:
+        logger.warning(f"Received audio for unknown call: {call_sid}")
+        return
+    
     try:
-        await websocket.accept(subprotocols=["stream"])
-        logger.info("WebSocket connection successfully accepted.")
-
-
-        stream_sid = None
-        
-        # Initialize conversation state
-        conversation_state = {
-            "last_response": "",
-            "waiting_for": None,  # Could be "sms_or_email", "mobile", "email"
-            "contact_info": None,
-            "delivery_method": None
+        # Send audio to Azure OpenAI for transcription
+        # This is a simplified example - you'll need to adapt this to your Azure OpenAI API
+        headers = {
+            "api-key": AZURE_OPENAI_API_KEY,
+            "Content-Type": "audio/mulaw"
         }
-
-        async with websockets.connect(
-            AZURE_OPENAI_API_ENDPOINT,
-            additional_headers={"api-key": AZURE_OPENAI_API_KEY},
-        ) as openai_ws:
-            await initialize_session(openai_ws)
-
-            async def receive_from_twilio():
-                nonlocal stream_sid
-                try:
-                    async for message in websocket.iter_text():
-                        data = json.loads(message)
-                        if data["event"] == "media":
-                            audio_append = {
-                                "type": "input_audio_buffer.append",
-                                "audio": data["media"]["payload"],
-                            }
-                            await openai_ws.send(json.dumps(audio_append))
-                        elif data["event"] == "start":
-                            stream_sid = data["start"]["streamSid"]
-                            logger.info(f"Stream started with SID: {stream_sid}")
-                            if stream_sid:
-                                conversation_states[stream_sid] = conversation_state
-                except WebSocketDisconnect:
-                    logger.warning("WebSocket disconnected by client.")
-                    if openai_ws.open:
-                        await openai_ws.close()
-                    if stream_sid and stream_sid in conversation_states:
-                        del conversation_states[stream_sid]
-
-            async def send_to_twilio():
-                try:
-                    async for openai_message in openai_ws:
-                        response = json.loads(openai_message)
-                        
-                        # Handle input from user
-                        if response.get("type") == "input_audio_buffer.committed":
-                            user_input = response.get("text", "").strip().lower()
-                            
-                            # Process based on conversation state
-                            if stream_sid and stream_sid in conversation_states:
-                                state = conversation_states[stream_sid]
-                                
-                                # Check for SMS or Email selection
-                                if state["waiting_for"] == "sms_or_email":
-                                    if "sms" in user_input:
-                                        state["delivery_method"] = "sms"
-                                        state["waiting_for"] = "mobile"
-                                        # Let the AI handle asking for the number
-                                    elif "email" in user_input:
-                                        state["delivery_method"] = "email"
-                                        state["waiting_for"] = "email"
-                                        # Let the AI handle asking for the email
-                                
-                                # Check for mobile number or email input
-                                elif state["waiting_for"] == "mobile" and any(char.isdigit() for char in user_input):
-                                    # Simple validation - check for digits
-                                    state["contact_info"] = user_input.replace(" ", "")
-                                    await send_sms(state["contact_info"], state["last_response"])
-                                    state["waiting_for"] = None
-                                    
-                                    # Let the AI know we've sent the SMS
-                                    await inject_assistant_message(openai_ws, "I've sent the information to your mobile number. Is there anything else you need help with?")
-                                    
-                                elif state["waiting_for"] == "email" and "@" in user_input:
-                                    # Simple validation - check for @ symbol
-                                    state["contact_info"] = user_input.replace(" ", "")
-                                    await send_email(state["contact_info"], "Information from Alinta Energy", state["last_response"])
-                                    state["waiting_for"] = None
-                                    
-                                    # Let the AI know we've sent the email
-                                    await inject_assistant_message(openai_ws, "I've sent the information to your email address. Is there anything else you need help with?")
-
-                        # Handle AI response for detecting SMS/Email prompt
-                        if response.get("type") == "response.text.done":
-                            full_response = response.get("text", "")
-                            if stream_sid and stream_sid in conversation_states:
-                                conversation_states[stream_sid]["last_response"] = full_response
-                                
-                                # If the AI asked about SMS or Email, update state
-                                if "sms or email" in full_response.lower():
-                                    conversation_states[stream_sid]["waiting_for"] = "sms_or_email"
-
-                        # Handle audio response
-                        if response.get("type") == "response.audio.delta" and "delta" in response:
-                            audio_payload = base64.b64encode(
-                                base64.b64decode(response["delta"])
-                            ).decode("utf-8")
-                            audio_delta = {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": audio_payload},
-                            }
-                            await websocket.send_json(audio_delta)
-
-                        # Handle function calls for RAG
-                        if response.get("type") == "response.function_call_arguments.done":
-                            function_name = response["name"]
-                            if function_name == "get_additional_context":
-                                query = json.loads(response["arguments"]).get("query", "")
-                                search_results = azure_search_rag(query)
-                                logger.info(f"RAG Results: {search_results}")
-                                await send_function_output(openai_ws, response["call_id"], search_results)
-                                
-                except Exception as e:
-                    logger.error(f"Error in send_to_twilio: {e}")
-
-            await asyncio.gather(receive_from_twilio(), send_to_twilio())
-
+        
+        files = {
+            'file': ('audio.mulaw', io.BytesIO(audio_data), 'audio/mulaw')
+        }
+        
+        # Transcribe the audio
+        transcription_response = requests.post(
+            f"{AZURE_OPENAI_API_ENDPOINT}/audio/transcriptions",
+            headers=headers,
+            files=files
+        )
+        
+        if transcription_response.status_code == 200:
+            transcription = transcription_response.json()
+            user_input = transcription.get("text", "").strip()
+            
+            if user_input:
+                # Update the transcript
+                active_calls[call_sid]["transcript"] += f"User: {user_input}\n"
+                active_calls[call_sid]["last_query"] = user_input
+                
+                # Process the user input based on conversation state
+                await process_user_input(call_sid, user_input)
+        else:
+            logger.error(f"Transcription failed: {transcription_response.text}")
+            
     except Exception as e:
-        logger.error(f"Critical WebSocket error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Error processing audio chunk: {e}")
 
+async def process_user_input(call_sid: str, user_input: str):
+    """Process user input and generate appropriate response"""
+    if call_sid not in active_calls:
+        return
+    
+    state = active_calls[call_sid]
+    user_input_lower = user_input.lower()
+    
+    # Check for special commands or conversation state
+    if user_input_lower == "hello" or user_input_lower == "hi":
+        response = "Hello, I am Jason from Alinta Energy. How can I help you today?"
+        await send_tts_response(call_sid, response)
+        return
+        
+    elif "thank you" in user_input_lower:
+        response = "You are welcome. Is there anything else I can help you with?"
+        await send_tts_response(call_sid, response)
+        return
+        
+    elif state["waiting_for"] == "sms_or_email":
+        if "sms" in user_input_lower:
+            state["delivery_method"] = "sms"
+            state["waiting_for"] = "mobile"
+            response = "Please tell me your mobile number."
+            await send_tts_response(call_sid, response)
+            return
+            
+        elif "email" in user_input_lower:
+            state["delivery_method"] = "email"
+            state["waiting_for"] = "email"
+            response = "Please tell me your email address."
+            await send_tts_response(call_sid, response)
+            return
+            
+    elif state["waiting_for"] == "mobile" and any(char.isdigit() for char in user_input):
+        state["contact_info"] = user_input.replace(" ", "")
+        success = await send_sms(state["contact_info"], state["last_response"])
+        
+        if success:
+            response = "I've sent the information to your mobile number. Is there anything else you need help with?"
+        else:
+            response = "I'm sorry, I couldn't send the SMS. Would you like to try again or try email instead?"
+            
+        state["waiting_for"] = None
+        await send_tts_response(call_sid, response)
+        return
+        
+    elif state["waiting_for"] == "email" and "@" in user_input:
+        state["contact_info"] = user_input.replace(" ", "")
+        success = await send_email(state["contact_info"], "Information from Alinta Energy", state["last_response"])
+        
+        if success:
+            response = "I've sent the information to your email address. Is there anything else you need help with?"
+        else:
+            response = "I'm sorry, I couldn't send the email. Would you like to try again or try SMS instead?"
+            
+        state["waiting_for"] = None
+        await send_tts_response(call_sid, response)
+        return
+    
+    # For general queries, perform RAG search
+    search_results = azure_search_rag(user_input)
+    
+    # Prepare response with RAG results
+    response = f"{search_results}"
+    
+    # Keep responses short
+    if len(response) > 200:
+        response = response[:197] + "..."
+    
+    # Store the response for potential SMS/email
+    state["last_response"] = response
+    
+    # Add the SMS/email option
+    response += " Would you like to receive this information via SMS or Email?"
+    
+    # Update state
+    state["waiting_for"] = "sms_or_email"
+    
+    # Send response back to user
+    await send_tts_response(call_sid, response)
 
-async def initialize_session(openai_ws):
-    """Initialize the OpenAI session with instructions and tools."""
-    session_update = {
-        "type": "session.update",
-        "session": {
-            "turn_detection": {"type": "server_vad"},
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "voice": VOICE,
-            "instructions": (
-                "You are an AI assistant providing factual answers ONLY from the search. "
-                "If USER says hello Always respond with with Hello, I am Jason from Alinta Energy. How can I help you today? "
-                "Use the `get_additional_context` function to retrieve relevant information. "
-                "Keep all your responses very concise and straight to point and not more than 30 words. "
-                "After providing any information, always ask: 'Would you like to receive this information via SMS or Email?' "
-                "If they choose SMS, ask for their mobile number. "
-                "If they choose Email, ask for their email address. "
-                "Once they provide these details, confirm you are sending the information and continue the conversation. "
-                "If USER says Thank You, Always respond with with You are welcome, Is there anything else I can help you with?"
-            ),
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "get_additional_context",
-                    "description": "Fetch context from Azure Search based on a user query.",
-                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
-                }
-            ],
-        },
-    }
-    await openai_ws.send(json.dumps(session_update))
-
-
-async def trigger_rag_search(openai_ws, query):
-    """Trigger RAG search for a specific query."""
-    search_function_call = {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "function_call",
-            "name": "get_additional_context",
-            "arguments": {"query": query},
-        },
-    }
-    await openai_ws.send(json.dumps(search_function_call))
-
-
-async def send_function_output(openai_ws, call_id, output):
-    """Send RAG results back to OpenAI."""
-    response = {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": output,
-        },
-    }
-    await openai_ws.send(json.dumps(response))
-
-    # Prompt OpenAI to continue processing
-    await openai_ws.send(json.dumps({"type": "response.create"}))
-
+async def send_tts_response(call_sid: str, text: str):
+    """Send text-to-speech response to the caller"""
+    try:
+        # Update the active call transcript
+        if call_sid in active_calls:
+            active_calls[call_sid]["transcript"] += f"Assistant: {text}\n"
+        
+        # Use Twilio TwiML to speak the response
+        twiml = VoiceResponse()
+        twiml.say(text)
+        
+        # Send the TwiML update to Twilio
+        twilio_client.calls(call_sid).update(twiml=str(twiml))
+        logger.info(f"Sent response to call {call_sid}: {text}")
+        
+    except Exception as e:
+        logger.error(f"Error sending TTS response: {e}")
 
 def azure_search_rag(query):
     """Perform Azure Cognitive Search and return results."""
@@ -317,24 +302,6 @@ def azure_search_rag(query):
     except Exception as e:
         logger.error(f"Error in Azure Search: {e}")
         return "Error retrieving data from Azure Search."
-
-
-
-# Add these helper functions
-async def inject_assistant_message(openai_ws, message):
-    """Inject a message into the conversation as if it came from the assistant."""
-    inject_message = {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "text", "text": message}]
-        }
-    }
-    await openai_ws.send(json.dumps(inject_message))
-    
-    # Prompt OpenAI to continue processing
-    await openai_ws.send(json.dumps({"type": "response.create"}))
 
 async def send_sms(phone_number, message):
     """Send SMS using Twilio."""
@@ -380,7 +347,22 @@ async def send_email(email_address, subject, message):
         logger.error(f"Error sending email: {e}")
         return False
 
+@app.post("/tester")
+async def test_endpoint(request: Request):
+    """Test endpoint for debugging"""
+    body = await request.body()
+    headers = dict(request.headers)
+    return {
+        "message": "Test endpoint received request",
+        "headers": headers,
+        "body_size": len(body)
+    }
+
+@app.get("/active-calls")
+async def get_active_calls():
+    """Admin endpoint to see active calls (In a production environment, secure this)"""
+    return {"active_calls": len(active_calls), "call_sids": list(active_calls.keys())}
+
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=PORT)
