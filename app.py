@@ -83,22 +83,25 @@ async def websocket_test():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     response = VoiceResponse()
-    response.say("Please wait while we connect your call.")
-    response.pause(length=1)
     
-    # Add a beep sound to indicate when the user should start speaking
-    response.play("https://api.twilio.com/cowbell.mp3")  # Use Twilio's standard tone
-    response.say("Please speak after the beep.")
+    # Initial greeting
+    response.say("Welcome to Alinta Energy. Please wait while we connect your call.")
+    response.pause(length=1)
     
     # Get the public-facing hostname
     host = request.headers.get("X-Forwarded-Host", request.url.hostname)
     
-    # Set up the WebSocket connection
+    # Set up the WebSocket connection first
     connect = Connect()
     ws_url = f"wss://{host}/media-stream"
     logger.info(f"Setting up Twilio stream connection to: {ws_url}")
     connect.stream(url=ws_url)
     response.append(connect)
+    
+    # Add a single beep and instruction after the stream is connected
+    # This ensures it only happens once
+    response.play(digits="1")  # Play a single DTMF tone as a beep
+    response.say("You can start talking now.")
     
     return HTMLResponse(content=str(response), media_type="application/xml")
 
