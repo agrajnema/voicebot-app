@@ -75,13 +75,12 @@ async def index_page():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming Twilio calls without form parsing"""
-    # Skip trying to parse form data
-    call_sid = "unknown"  # We won't have the CallSid but that's ok
+    # Skip trying to parse form data for now
+    call_sid = "unknown"
     
     logger.info(f"Incoming call received, skipping form parsing")
     
     # Initialize a generic call state
-    # We'll use a timestamp as a temporary ID
     temp_call_id = f"call_{int(time.time())}"
     active_calls[temp_call_id] = {
         "last_response": "",
@@ -96,20 +95,31 @@ async def handle_incoming_call(request: Request):
     response.say("Please wait while we connect your call.")
     response.pause(length=1)
     
-    # Get the public-facing hostname
+    # Get the FULL public URL - this is crucial
     host = request.headers.get("X-Forwarded-Host", request.url.hostname)
-    protocol = request.headers.get("X-Forwarded-Proto", "https")
-    base_url = f"{protocol}://{host}"
+    if not host:
+        host = "slack-attack-app-agbne8fsf8drdpgd.eastus2-01.azurewebsites.net"  # Fallback to your known domain
     
-    # Set up the Media Stream
+    # Ensure we have a proper protocol
+    protocol = "https"
+    
+    # Create fully qualified URLs
+    status_callback_url = f"{protocol}://{host}/stream-status"
+    media_url = f"{protocol}://{host}/media-stream"
+    
+    # Log the URLs to help with debugging
+    logger.info(f"Status callback URL: {status_callback_url}")
+    logger.info(f"Media URL: {media_url}")
+    
+    # Set up the Media Stream with FULLY QUALIFIED URLs
     connect = Connect()
     media = connect.stream(name='Alinta Energy Voice Bot')
     
-    # Configure the stream
+    # Configure the stream with proper URLs
     media.parameter(name="contentType", value="audio/x-mulaw")
-    media.parameter(name="statusCallback", value=f"{base_url}/stream-status")
+    media.parameter(name="statusCallback", value=status_callback_url)
     media.parameter(name="track", value="inbound_track")
-    media.parameter(name="url", value=f"{base_url}/media-stream")
+    media.parameter(name="url", value=media_url)
     
     response.append(connect)
     response.say("You can start talking now!")
