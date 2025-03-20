@@ -79,46 +79,50 @@ async def index_page():
 async def websocket_test():
     return {"websocket_supported": True, "message": "WebSocket endpoint is operational"}
 
+# 1. Fix for incoming call and beep issue
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     # Create TwiML response
     response = VoiceResponse()
     
-    # Get form data - this captures the call SID for later use
+    # Get form data to capture the call SID
     form_data = await request.form()
     call_sid = form_data.get('CallSid')
     logger.info(f"Incoming call with SID: {call_sid}")
     
-    # Store the call SID in a global mapping
-    if call_sid:
-        # Create a global mapping if it doesn't exist
-        if not hasattr(app, 'call_mappings'):
-            app.call_mappings = {}
-        app.call_mappings[call_sid] = {'active': True}
-    
-    # Welcome message
+    # Initial greeting - keep this short
     response.say("Welcome to Alinta Energy.")
     
-    # Add an explicit beep sound using Twilio's built-in capability
-    # The 'w' makes it pause for half a second
-    response.play(digits="1w")
+    # Add a small pause
+    response.pause(length=0.5)
     
-    # Get the host for the WebSocket connection
+    # Get the public-facing hostname
     host = request.headers.get("X-Forwarded-Host", request.url.hostname)
     if request.url.port and request.url.port != 443:
         host = f"{host}:{request.url.port}"
     
-    # Set up the WebSocket connection
+    # Log the host for debugging
+    logger.info(f"Using host for WebSocket connection: {host}")
+    
+    # Create the Connect verb with proper WebSocket URL
     connect = Connect()
     ws_url = f"wss://{host}/media-stream"
-    logger.info(f"Setting up Twilio stream connection to: {ws_url}")
     connect.stream(url=ws_url)
+    
+    # Add the connect element to the response
     response.append(connect)
     
-    # Add instruction after the beep
+    # Play a DTMF tone (beep) AFTER the stream connection
+    # Using digit 1 with a pause
+    response.play(digits="1w")
+    
+    # Instruction to start talking after the beep
     response.say("You can start talking now.")
     
-    logger.info(f"Generated TwiML: {str(response)}")
+    # Log the full TwiML for debugging
+    logger.info(f"Generated TwiML response: {str(response)}")
+    
+    # Return the TwiML response
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 # Add this to your global variables
@@ -128,6 +132,7 @@ conversation_states = {}
 async def handle_media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt from Twilio.")
     try:
+        # Accept the WebSocket connection
         await websocket.accept()
         logger.info("WebSocket connection successfully accepted.")
 
@@ -140,42 +145,54 @@ async def handle_media_stream(websocket: WebSocket):
             "waiting_for": None,
             "contact_info": None,
             "delivery_method": None,
-            "email_chars": [],  # For storing email character by character
-            "mobile_digits": [],  # For storing mobile digits
-            "confirmed_email": None,  # For storing confirmed email
-            "disconnect_attempts": 0  # Track goodbye attempts
+            "email_chars": [],
+            "mobile_digits": [],
+            "confirmed_email": None,
+            "confirmed_mobile": None,
+            "disconnect_attempts": 0,
+            "last_query": "",
+            "last_result": ""
         }
 
-        # Create proper headers for the websocket connection
+        # Connect to OpenAI with proper headers
         headers = {"api-key": AZURE_OPENAI_API_KEY}
         
-        # Connect to OpenAI API with proper headers
-        async with websockets.connect(
-            AZURE_OPENAI_API_ENDPOINT,
-            extra_headers=headers
-        ) as openai_ws:
+        # Use proper error handling for OpenAI connection
+        try:
+            openai_ws = await websockets.connect(AZURE_OPENAI_API_ENDPOINT, extra_headers=headers)
+            logger.info("Successfully connected to OpenAI API")
+        except Exception as e:
+            logger.error(f"Failed to connect to OpenAI API: {e}")
+            await websocket.close()
+            return
+        
+        try:
+            # Initialize the OpenAI session
             await initialize_session(openai_ws)
-
+            logger.info("OpenAI session initialized successfully")
+            
+            # Function to handle Twilio reception
             async def receive_from_twilio():
                 nonlocal stream_sid, call_sid
                 try:
                     async for message in websocket.iter_text():
                         try:
-                            # Log the raw message for debugging
+                            # Debug log the raw message
                             logger.debug(f"Raw message from Twilio: {message[:100]}...")
                             
                             data = json.loads(message)
-                            logger.info(f"Received Twilio event: {data['event']}")
+                            event_type = data.get("event")
+                            logger.info(f"Received Twilio event: {event_type}")
                             
-                            if data["event"] == "media":
+                            if event_type == "media":
                                 audio_append = {
                                     "type": "input_audio_buffer.append",
                                     "audio": data["media"]["payload"],
                                 }
                                 await openai_ws.send(json.dumps(audio_append))
-                            elif data["event"] == "start":
+                            elif event_type == "start":
                                 stream_sid = data["start"]["streamSid"]
-                                # Extract call_sid from stream_sid (Twilio format: CAXXXX.MXXXX)
+                                # Extract call_sid from stream_sid
                                 if "." in stream_sid:
                                     call_sid = stream_sid.split('.')[0]
                                     logger.info(f"Extracted call SID: {call_sid}")
@@ -184,22 +201,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                                 # Initialize conversation state
                                 if stream_sid:
-                                    conversation_states[stream_sid] = {
-                                        "last_response": "",
-                                        "waiting_for": None,
-                                        "contact_info": None,
-                                        "delivery_method": None,
-                                        "email_chars": [],
-                                        "mobile_digits": [],
-                                        "confirmed_email": None,
-                                        "confirmed_mobile": None,
-                                        "disconnect_attempts": 0
-                                    }
-                                    
-                                    # Store in the global mapping for later use
-                                    if call_sid and hasattr(app, 'call_mappings'):
-                                        app.call_mappings[call_sid] = {'active': True, 'stream_sid': stream_sid}
-                            elif data["event"] == "stop":
+                                    conversation_states[stream_sid] = conversation_state
+                            elif event_type == "stop":
                                 logger.info("Received stop event from Twilio")
                                 # Cleanup on stop event
                                 if stream_sid and stream_sid in conversation_states:
@@ -221,247 +224,226 @@ async def handle_media_stream(websocket: WebSocket):
                         del conversation_states[stream_sid]
                     logger.info("Exiting receive_from_twilio function")
 
+            # Function to handle sending to Twilio
             async def send_to_twilio():
                 try:
                     async for openai_message in openai_ws:
-                        response = json.loads(openai_message)
-                        
-                        # Handle input from user
-                        if response.get("type") == "input_audio_buffer.committed":
-                            user_input = response.get("text", "").strip().lower()
-                            logger.info(f"User input committed: {user_input}")
+                        try:
+                            response = json.loads(openai_message)
+                            response_type = response.get("type", "")
                             
-                            if not stream_sid or stream_sid not in conversation_states:
-                                continue
+                            # Handle user input committed by OpenAI
+                            if response_type == "input_audio_buffer.committed":
+                                user_input = response.get("text", "").strip().lower()
+                                logger.info(f"User input committed: '{user_input}'")
                                 
-                            state = conversation_states[stream_sid]
-                            
-                            # Check for call end keywords with increased sensitivity
-                            if any(word in user_input for word in ["bye", "goodbye", "end", "hang up", "thank you bye", "no thank you", "that's all"]):
-                                state["disconnect_attempts"] += 1
-                                logger.info(f"Possible end call keyword detected: '{user_input}', attempt {state['disconnect_attempts']}")
-                                
-                                # If we've detected it multiple times, or it's a strong match
-                                if state["disconnect_attempts"] >= 2 or any(phrase in user_input for phrase in ["goodbye", "hang up", "end call"]):
-                                    await inject_assistant_message(openai_ws, "Thank you for calling Alinta Energy. Goodbye!")
-                                    # End the call after the goodbye message
-                                    asyncio.create_task(terminate_call(call_sid))
-                                    return
-                            
-                            # Process based on conversation state
-                            if state["waiting_for"] == "sms_or_email":
-                                if "sms" in user_input or "text" in user_input or "message" in user_input:
-                                    state["delivery_method"] = "sms"
-                                    state["waiting_for"] = "mobile"
-                                    state["mobile_digits"] = []
-                                    await inject_assistant_message(openai_ws, 
-                                        "I'll need your mobile number. Please say each digit one at a time, and I'll confirm each digit.")
-                                elif "email" in user_input or "mail" in user_input or "e-mail" in user_input:
-                                    state["delivery_method"] = "email"
-                                    state["waiting_for"] = "email_chars"
-                                    state["email_chars"] = []
-                                    await inject_assistant_message(openai_ws, 
-                                        "I'll need your email address. Please spell out your email one character at a time. "
-                                        "Say 'at' for @, 'dot' for period, and I'll confirm each character.")
-                                elif "neither" in user_input or "none" in user_input or "no" in user_input:
-                                    state["waiting_for"] = None
-                                    await inject_assistant_message(openai_ws, "No problem. Is there anything else I can help you with?")
-                            
-                            # Handle mobile number input
-                            elif state["waiting_for"] == "mobile":
-                                # Extract digits
-                                digits = re.findall(r'\d', user_input)
-                                
-                                if digits:
-                                    # Process each digit individually with confirmation
-                                    for digit in digits:
-                                        # Add the digit to our collection
-                                        state["mobile_digits"].append(digit)
-                                        
-                                        # Confirm each digit as it's received
-                                        await inject_assistant_message(openai_ws, f"I heard the digit {digit}. "
-                                                                    f"So far I have {' '.join(state['mobile_digits'])}. "
-                                                                    f"Please continue with the next digit or say 'done' if complete.")
+                                if not stream_sid or stream_sid not in conversation_states:
+                                    logger.warning("No active conversation state found")
+                                    continue
                                     
-                                    # Check if we have enough digits for a phone number
-                                    if len(state["mobile_digits"]) >= 10:
-                                        # Format into a phone number
-                                        mobile = ''.join(state["mobile_digits"])
+                                state = conversation_states[stream_sid]
+                                state["last_query"] = user_input
+                                
+                                # Enhanced call end detection
+                                end_call_phrases = ["bye", "goodbye", "end", "hang up", "thank you bye", 
+                                                  "no thank you", "that's all", "thank you", "thanks bye"]
+                                
+                                if any(phrase in user_input for phrase in end_call_phrases):
+                                    state["disconnect_attempts"] += 1
+                                    logger.info(f"End call keyword detected: '{user_input}', attempt {state['disconnect_attempts']}")
+                                    
+                                    if state["disconnect_attempts"] >= 1:
+                                        logger.info("Ending call due to goodbye detection")
+                                        await inject_assistant_message(openai_ws, "Thank you for calling Alinta Energy. Goodbye!")
                                         
-                                        # Add leading + if international format needed
-                                        if not mobile.startswith('+'):
-                                            mobile = '+' + mobile
+                                        # End the call after a short delay
+                                        asyncio.create_task(end_call_with_delay(call_sid, 3))
+                                
+                                # Process conversation states for email/SMS collection
+                                if state["waiting_for"] == "sms_or_email":
+                                    if any(word in user_input for word in ["sms", "text", "message", "txt"]):
+                                        state["delivery_method"] = "sms"
+                                        state["waiting_for"] = "mobile"
+                                        state["mobile_digits"] = []
+                                        await inject_assistant_message(openai_ws, 
+                                            "I'll need your mobile number. Please say each digit one at a time, and I'll confirm each digit.")
+                                    elif any(word in user_input for word in ["email", "mail", "e-mail", "electronic"]):
+                                        state["delivery_method"] = "email"
+                                        state["waiting_for"] = "email_chars"
+                                        state["email_chars"] = []
+                                        await inject_assistant_message(openai_ws, 
+                                            "I'll need your email address. Please spell out your email one character at a time. "
+                                            "Say 'at' for @, 'dot' for period, and I'll confirm each character.")
+                                    elif any(word in user_input for word in ["neither", "none", "no", "cancel"]):
+                                        state["waiting_for"] = None
+                                        await inject_assistant_message(openai_ws, "No problem. Is there anything else I can help you with?")
+                                
+                                # Handle mobile number collection
+                                elif state["waiting_for"] == "mobile":
+                                    # Extract digits
+                                    digits = re.findall(r'\d', user_input)
+                                    
+                                    if digits:
+                                        # Process each digit with confirmation
+                                        for digit in digits:
+                                            state["mobile_digits"].append(digit)
                                             
-                                        state["confirmed_mobile"] = mobile
-                                        state["waiting_for"] = "confirm_mobile"
-                                        
-                                        # Spell out the digits for confirmation
-                                        spelled_number = ' '.join(state["mobile_digits"])
-                                        await inject_assistant_message(openai_ws, 
-                                            f"I have your complete number as {spelled_number}. Is that correct? Please say yes or no.")
-                                else:
-                                    # If "done" is said, check if we have enough digits
-                                    if "done" in user_input.lower() and len(state["mobile_digits"]) >= 10:
+                                            # Confirm each digit
+                                            digit_confirmation = f"I heard the digit {digit}. So far I have {' '.join(state['mobile_digits'])}. "
+                                            if len(state["mobile_digits"]) >= 10:
+                                                digit_confirmation += "That should be enough digits. Is this number correct? Please say yes or no."
+                                                state["waiting_for"] = "confirm_mobile"
+                                                state["confirmed_mobile"] = ''.join(state["mobile_digits"])
+                                            else:
+                                                digit_confirmation += "Please continue with the next digit or say 'done' if complete."
+                                            
+                                            await inject_assistant_message(openai_ws, digit_confirmation)
+                                    elif "done" in user_input and len(state["mobile_digits"]) >= 10:
                                         mobile = ''.join(state["mobile_digits"])
-                                        if not mobile.startswith('+'):
-                                            mobile = '+' + mobile
                                         state["confirmed_mobile"] = mobile
                                         state["waiting_for"] = "confirm_mobile"
-                                        spelled_number = ' '.join(state["mobile_digits"])
                                         await inject_assistant_message(openai_ws, 
-                                            f"I have your number as {spelled_number}. Is that correct? Please say yes or no.")
+                                            f"I have your number as {' '.join(state['mobile_digits'])}. Is that correct? Please say yes or no.")
                                     else:
                                         await inject_assistant_message(openai_ws, 
                                             "I didn't catch any digits. Please say the next digit of your mobile number.")
-                            
-                            # Handle email character input
-                            elif state["waiting_for"] == "email_chars":
-                                # Process input for characters
-                                user_input = user_input.lower().strip()
                                 
-                                # Handle special characters
-                                if "at" in user_input or "@" in user_input:
-                                    state["email_chars"].append("@")
-                                    char_added = "@"
-                                elif "dot" in user_input or "period" in user_input:
-                                    state["email_chars"].append(".")
-                                    char_added = "."
-                                elif "underscore" in user_input:
-                                    state["email_chars"].append("_")
-                                    char_added = "_"
-                                elif "dash" in user_input or "hyphen" in user_input:
-                                    state["email_chars"].append("-")
-                                    char_added = "-"
-                                # Handle single character input
-                                elif len(user_input) == 1 and user_input.isalnum():
-                                    state["email_chars"].append(user_input)
-                                    char_added = user_input
-                                # Handle spelled out characters
-                                elif user_input in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", 
-                                                "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
-                                                "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]:
-                                    state["email_chars"].append(user_input)
-                                    char_added = user_input
-                                # Handle common letter clarifications
-                                elif "as in" in user_input:
-                                    # Extract the letter from phrases like "b as in boy"
-                                    parts = user_input.split()
-                                    if parts and len(parts[0]) == 1 and parts[0].isalpha():
-                                        state["email_chars"].append(parts[0])
-                                        char_added = parts[0]
+                                # Handle email character collection
+                                elif state["waiting_for"] == "email_chars":
+                                    # Handle special characters
+                                    char_added = None
+                                    
+                                    if any(word in user_input for word in ["at sign", "at symbol", "at"]) or "@" in user_input:
+                                        state["email_chars"].append("@")
+                                        char_added = "@"
+                                    elif any(word in user_input for word in ["dot", "period", "point", "full stop"]):
+                                        state["email_chars"].append(".")
+                                        char_added = "."
+                                    elif "underscore" in user_input:
+                                        state["email_chars"].append("_")
+                                        char_added = "_"
+                                    elif any(word in user_input for word in ["dash", "hyphen", "minus"]):
+                                        state["email_chars"].append("-")
+                                        char_added = "-"
+                                    # Handle alphabet input
+                                    elif user_input in "abcdefghijklmnopqrstuvwxyz0123456789":
+                                        state["email_chars"].append(user_input)
+                                        char_added = user_input
+                                    # Handle completion
+                                    elif any(word in user_input for word in ["done", "complete", "finished", "that's it"]):
+                                        email_so_far = ''.join(state["email_chars"])
+                                        if "@" in email_so_far and "." in email_so_far.split("@")[1]:
+                                            state["confirmed_email"] = email_so_far
+                                            state["waiting_for"] = "confirm_email"
+                                            
+                                            # Spell out the email for confirmation
+                                            spelled_email = spell_out_email(email_so_far)
+                                            await inject_assistant_message(openai_ws, 
+                                                f"I have your complete email as {spelled_email}. Is that correct? Please say yes or no.")
+                                        else:
+                                            await inject_assistant_message(openai_ws, 
+                                                "The email doesn't seem complete. It should contain an @ symbol and a domain with a dot. Please continue.")
                                     else:
+                                        # Try to extract a single character
+                                        first_char = extract_first_char(user_input)
+                                        if first_char:
+                                            state["email_chars"].append(first_char)
+                                            char_added = first_char
+                                        else:
+                                            await inject_assistant_message(openai_ws, 
+                                                "I didn't catch that character. Please say a single character, 'at' for @, 'dot' for period, or 'done' when complete.")
+                                            continue
+                                    
+                                    # If we added a character, provide feedback
+                                    if char_added:
+                                        email_so_far = ''.join(state["email_chars"])
                                         await inject_assistant_message(openai_ws, 
-                                            "I didn't catch that character. Please say a single letter or number.")
-                                        continue
-                                # Check for completion
-                                elif "done" in user_input or "complete" in user_input or "finished" in user_input:
-                                    # Check if we have a valid email format with @ symbol
-                                    email_so_far = ''.join(state["email_chars"])
-                                    if "@" in email_so_far and "." in email_so_far.split("@")[1]:
-                                        state["confirmed_email"] = email_so_far
-                                        state["waiting_for"] = "confirm_email"
+                                            f"Added '{char_added}'. Your email so far is {spell_out_email(email_so_far)}. "
+                                            f"Please say the next character or 'done' if complete.")
+                                
+                                # Handle confirmations
+                                elif state["waiting_for"] == "confirm_mobile":
+                                    if any(word in user_input for word in ["yes", "correct", "right", "yep", "yeah"]):
+                                        mobile = state["confirmed_mobile"]
+                                        if not mobile.startswith('+'):
+                                            mobile = '+' + mobile
+                                        success = await send_sms(mobile, state["last_result"])
+                                        state["waiting_for"] = None
                                         
-                                        # Spell out the email for confirmation
-                                        spelled_email = spell_out_email(email_so_far)
-                                        await inject_assistant_message(openai_ws, 
-                                            f"I have your complete email as {spelled_email}. Is that correct? Please say yes or no.")
-                                        continue
+                                        if success:
+                                            await inject_assistant_message(openai_ws, 
+                                                f"Great! I've sent the information to your mobile. Is there anything else you need help with?")
+                                        else:
+                                            await inject_assistant_message(openai_ws, 
+                                                "I'm sorry, there was an issue sending the SMS. Let's continue with something else. What else can I help you with?")
                                     else:
+                                        # Start over with mobile
+                                        state["mobile_digits"] = []
+                                        state["waiting_for"] = "mobile"
                                         await inject_assistant_message(openai_ws, 
-                                            "The email doesn't seem complete. It should contain an @ symbol and a domain with a dot. Please continue.")
-                                        continue
-                                else:
-                                    await inject_assistant_message(openai_ws, 
-                                        "I didn't understand that. Please say a single character, 'at' for @, 'dot' for period, or 'done' when complete.")
-                                    continue
+                                            "Let's try again. Please say your mobile number one digit at a time, and I'll confirm each digit.")
                                 
-                                # Current email construction with feedback
-                                email_so_far = ''.join(state["email_chars"])
-                                
-                                # Confirm the character that was just added
-                                await inject_assistant_message(openai_ws, 
-                                    f"Added '{char_added}'. Your email so far is {spell_out_email(email_so_far)}. "
-                                    f"Please say the next character or 'done' if complete.")
+                                elif state["waiting_for"] == "confirm_email":
+                                    if any(word in user_input for word in ["yes", "correct", "right", "yep", "yeah"]):
+                                        email_address = state["confirmed_email"]
+                                        success = await send_email(email_address, "Information from Alinta Energy", state["last_result"])
+                                        state["waiting_for"] = None
+                                        
+                                        if success:
+                                            await inject_assistant_message(openai_ws, 
+                                                f"Great! I've sent the information to {email_address}. Is there anything else you need help with?")
+                                        else:
+                                            await inject_assistant_message(openai_ws, 
+                                                "I'm sorry, there was an issue sending the email. Let's continue with something else. What else can I help you with?")
+                                    else:
+                                        # Start over with email
+                                        state["email_chars"] = []
+                                        state["waiting_for"] = "email_chars"
+                                        await inject_assistant_message(openai_ws, 
+                                            "Let's try again. Please spell out your email one character at a time. I'll confirm each character as we go.")
                             
-                            # Handle mobile confirmation
-                            elif state["waiting_for"] == "confirm_mobile":
-                                if "yes" in user_input or "correct" in user_input or "right" in user_input:
-                                    # Send the SMS
-                                    mobile = state["confirmed_mobile"]
-                                    success = await send_sms(mobile, state["last_response"])
-                                    state["waiting_for"] = None
-                                    
-                                    if success:
-                                        await inject_assistant_message(openai_ws, 
-                                            f"Great! I've sent the information to your mobile. Is there anything else you need help with?")
-                                    else:
-                                        await inject_assistant_message(openai_ws, 
-                                            "I'm sorry, there was an issue sending the SMS. Let's continue with something else. What else can I help you with?")
-                                else:
-                                    # Start over with mobile
-                                    state["mobile_digits"] = []
-                                    state["waiting_for"] = "mobile"
-                                    await inject_assistant_message(openai_ws, 
-                                        "Let's try again. Please say your mobile number one digit at a time, and I'll confirm each digit.")
-                            
-                            # Handle email confirmation
-                            elif state["waiting_for"] == "confirm_email":
-                                if "yes" in user_input or "correct" in user_input or "right" in user_input:
-                                    # Send the email
-                                    email_address = state["confirmed_email"]
-                                    success = await send_email(email_address, "Information from Alinta Energy", state["last_response"])
-                                    state["waiting_for"] = None
-                                    
-                                    if success:
-                                        await inject_assistant_message(openai_ws, 
-                                            f"Great! I've sent the information to {email_address}. Is there anything else you need help with?")
-                                    else:
-                                        await inject_assistant_message(openai_ws, 
-                                            "I'm sorry, there was an issue sending the email. Let's continue with something else. What else can I help you with?")
-                                else:
-                                    # Start over with email
-                                    state["email_chars"] = []
-                                    state["waiting_for"] = "email_chars"
-                                    await inject_assistant_message(openai_ws, 
-                                        "Let's try again. Please spell out your email one character at a time. I'll confirm each character as we go.")
-
-                        # Handle AI response for detecting SMS/Email prompt
-                        if response.get("type") == "response.text.done":
-                            full_response = response.get("text", "")
-                            logger.info(f"AI full response: {full_response}")
-                            if stream_sid and stream_sid in conversation_states:
-                                conversation_states[stream_sid]["last_response"] = full_response
+                            # Handle AI response text
+                            elif response_type == "response.text.done":
+                                full_response = response.get("text", "")
+                                logger.info(f"AI full response: {full_response}")
                                 
-                                # If the AI asked about SMS or Email, update state
-                                if "sms or email" in full_response.lower():
-                                    conversation_states[stream_sid]["waiting_for"] = "sms_or_email"
-                                    logger.info("Detected SMS/Email prompt - waiting for user selection")
-
-                        # Handle audio response
-                        if response.get("type") == "response.audio.delta" and "delta" in response:
-                            try:
-                                audio_payload = base64.b64encode(
-                                    base64.b64decode(response["delta"])
-                                ).decode("utf-8")
-                                audio_delta = {
-                                    "event": "media",
-                                    "streamSid": stream_sid,
-                                    "media": {"payload": audio_payload},
-                                }
-                                # Convert to JSON string before sending
-                                await websocket.send_text(json.dumps(audio_delta))
-                            except Exception as e:
-                                logger.error(f"Error sending audio to Twilio: {e}")
-
-                        # Handle function calls for RAG
-                        if response.get("type") == "response.function_call_arguments.done":
-                            function_name = response["name"]
-                            if function_name == "get_additional_context":
-                                query = json.loads(response["arguments"]).get("query", "")
-                                search_results = azure_search_rag(query)
-                                logger.info(f"RAG Results: {search_results}")
-                                await send_function_output(openai_ws, response["call_id"], search_results)
+                                if stream_sid and stream_sid in conversation_states:
+                                    state = conversation_states[stream_sid]
+                                    state["last_result"] = full_response
                                     
+                                    # If the AI asked about SMS or Email, update state
+                                    if "sms or email" in full_response.lower():
+                                        state["waiting_for"] = "sms_or_email"
+                                        logger.info("Detected SMS/Email prompt - waiting for user selection")
+                            
+                            # Handle audio response
+                            elif response_type == "response.audio.delta" and "delta" in response:
+                                try:
+                                    audio_payload = base64.b64encode(
+                                        base64.b64decode(response["delta"])
+                                    ).decode("utf-8")
+                                    audio_delta = {
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {"payload": audio_payload},
+                                    }
+                                    # Convert to JSON string before sending
+                                    await websocket.send_text(json.dumps(audio_delta))
+                                except Exception as e:
+                                    logger.error(f"Error sending audio to Twilio: {e}")
+                            
+                            # Handle function calls for RAG
+                            elif response_type == "response.function_call_arguments.done":
+                                function_name = response["name"]
+                                if function_name == "get_additional_context":
+                                    query = json.loads(response["arguments"]).get("query", "")
+                                    search_results = azure_search_rag(query)
+                                    logger.info(f"RAG Results: {search_results}")
+                                    await send_function_output(openai_ws, response["call_id"], search_results)
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON parse error for OpenAI message: {e}")
+                        except Exception as e:
+                            logger.error(f"Error processing OpenAI message: {e}")
                 except Exception as e:
                     logger.error(f"Error in send_to_twilio: {e}")
                     import traceback
@@ -469,11 +451,47 @@ async def handle_media_stream(websocket: WebSocket):
 
             # Run both coroutines concurrently
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
+        
+        finally:
+            # Ensure OpenAI connection is closed properly
+            await openai_ws.close()
+            logger.info("OpenAI connection closed")
 
     except Exception as e:
         logger.error(f"Critical WebSocket error: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
+    finally:
+        # Clean up WebSocket connection
+        if not websocket.client_state == WebSocket.DISCONNECTED:
+            await websocket.close()
+        logger.info("WebSocket connection closed")
+
+def extract_first_char(text):
+    """Try to extract the first character from various input formats"""
+    # Check for common phrases like "a as in apple"
+    match = re.search(r'([a-z])\s+as\s+in', text)
+    if match:
+        return match.group(1)
+    
+    # Check for phrases like "capital B" or "uppercase B"
+    match = re.search(r'(?:capital|uppercase)\s+([a-z])', text)
+    if match:
+        return match.group(1).upper()
+    
+    # For simple letter mentions (first letter mentioned)
+    match = re.search(r'\b([a-z])\b', text)
+    if match:
+        return match.group(1)
+    
+    # For number mentions
+    match = re.search(r'\b(zero|one|two|three|four|five|six|seven|eight|nine)\b', text)
+    if match:
+        number_words = {"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", 
+                        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
+        return number_words.get(match.group(1))
+    
+    return None
 
 # Add this as a standalone function
 async def terminate_call(call_sid):
@@ -548,6 +566,10 @@ def spell_out_email(email):
             result += " at "
         elif char == '.':
             result += " dot "
+        elif char == '_':
+            result += " underscore "
+        elif char == '-':
+            result += " dash "
         else:
             result += f" {char} "
     return result
@@ -571,24 +593,31 @@ async def end_call(call_sid):
         logger.error(traceback.format_exc())
 
 # Add function to end call after a delay
-async def end_call_after_delay(stream_sid, delay_seconds):
-    """End the call after a specified delay to allow goodbye message to play"""
+async def end_call_with_delay(call_sid, delay_seconds=3):
+    """End the call after a delay to allow for goodbye message"""
+    if not call_sid:
+        logger.error("No call_sid available for ending call")
+        return
+    
+    logger.info(f"Will end call {call_sid} after {delay_seconds} seconds")
+    await asyncio.sleep(delay_seconds)
+    
     try:
-        logger.info(f"Will end call with SID {stream_sid} after {delay_seconds} seconds")
-        await asyncio.sleep(delay_seconds)
-        
-        # Get the call SID associated with this stream
-        # Note: You may need to store a mapping between stream_sid and call_sid
-        call_sid = stream_sid.split('.')[0] if stream_sid and '.' in stream_sid else None
-        
-        if call_sid:
-            # End the call using Twilio's API
-            twilio_client.calls(call_sid).update(status="completed")
-            logger.info(f"Call with SID {call_sid} has been ended")
-        else:
-            logger.error(f"Could not extract call SID from stream SID: {stream_sid}")
+        # Use Twilio client to end the call
+        twilio_client.calls(call_sid).update(status="completed")
+        logger.info(f"Call {call_sid} has been ended")
     except Exception as e:
         logger.error(f"Error ending call: {e}")
+        
+        # Fallback: Try direct API call
+        try:
+            import requests
+            url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json"
+            data = {"Status": "completed"}
+            response = requests.post(url, data=data, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+            logger.info(f"Fallback call termination result: {response.status_code}")
+        except Exception as e2:
+            logger.error(f"Fallback call termination also failed: {e2}")
 
 async def initialize_session(openai_ws):
     """Initialize the OpenAI session with instructions and tools."""
@@ -600,15 +629,17 @@ async def initialize_session(openai_ws):
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
             "instructions": (
-                "You are an AI assistant providing factual answers ONLY from the search. "
+                "You are an AI assistant providing factual answers from the search. "
+                "When responding to a user query, first briefly reiterate what they asked, then provide your answer clearly. "
                 "If USER says hello Always respond with with Hello, I am Jason from Alinta Energy. How can I help you today? "
                 "Use the `get_additional_context` function to retrieve relevant information. "
-                "Keep all your responses very concise and straight to point and not more than 30 words. "
+                "Keep all your responses concise and straight to the point, not more than 30-50 words. "
                 "After providing any information, always ask: 'Would you like to receive this information via SMS or Email?' "
                 "If they choose SMS, ask for their mobile number. "
-                "If they choose Email, ask for their email address. "
+                "If they choose Email, collect the email character by character. "
                 "Once they provide these details, confirm you are sending the information and continue the conversation. "
-                "If USER says Thank You, Always respond with with You are welcome, Is there anything else I can help you with?"
+                "If USER says Thank You, Always respond with 'You are welcome, Is there anything else I can help you with?' "
+                "When the user says goodbye or indicates they want to end the call, thank them for calling and say goodbye."
             ),
             "tools": [
                 {
