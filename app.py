@@ -109,7 +109,7 @@ conversation_states = {}
 async def handle_media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt from Twilio.")
     try:
-        # Remove the subprotocols parameter - not supported in FastAPI
+        # Accept the WebSocket connection from Twilio
         await websocket.accept()
         logger.info("WebSocket connection successfully accepted.")
 
@@ -123,9 +123,14 @@ async def handle_media_stream(websocket: WebSocket):
             "delivery_method": None
         }
 
+        # The issue is with the additional_headers parameter - fix the connection to OpenAI
+        # Create proper headers for the websocket connection
+        headers = {"api-key": AZURE_OPENAI_API_KEY}
+        
+        # Connect to OpenAI API with proper headers
         async with websockets.connect(
             AZURE_OPENAI_API_ENDPOINT,
-            additional_headers={"api-key": AZURE_OPENAI_API_KEY},
+            extra_headers=headers  # Use extra_headers instead of additional_headers
         ) as openai_ws:
             await initialize_session(openai_ws)
 
@@ -133,9 +138,6 @@ async def handle_media_stream(websocket: WebSocket):
                 nonlocal stream_sid
                 try:
                     async for message in websocket.iter_text():
-                        # Log the raw message for debugging
-                        logger.debug(f"Raw message from Twilio: {message[:100]}...")
-                        
                         data = json.loads(message)
                         logger.info(f"Received Twilio event: {data['event']}")
                         
@@ -159,8 +161,6 @@ async def handle_media_stream(websocket: WebSocket):
                 finally:
                     if stream_sid and stream_sid in conversation_states:
                         del conversation_states[stream_sid]
-                    if openai_ws.open:
-                        await openai_ws.close()
 
             async def send_to_twilio():
                 try:
@@ -181,29 +181,21 @@ async def handle_media_stream(websocket: WebSocket):
                                     if "sms" in user_input:
                                         state["delivery_method"] = "sms"
                                         state["waiting_for"] = "mobile"
-                                        # Let the AI handle asking for the number
                                     elif "email" in user_input:
                                         state["delivery_method"] = "email"
                                         state["waiting_for"] = "email"
-                                        # Let the AI handle asking for the email
                                 
                                 # Check for mobile number or email input
                                 elif state["waiting_for"] == "mobile" and any(char.isdigit() for char in user_input):
-                                    # Simple validation - check for digits
                                     state["contact_info"] = user_input.replace(" ", "")
                                     await send_sms(state["contact_info"], state["last_response"])
                                     state["waiting_for"] = None
-                                    
-                                    # Let the AI know we've sent the SMS
                                     await inject_assistant_message(openai_ws, "I've sent the information to your mobile number. Is there anything else you need help with?")
                                     
                                 elif state["waiting_for"] == "email" and "@" in user_input:
-                                    # Simple validation - check for @ symbol
                                     state["contact_info"] = user_input.replace(" ", "")
                                     await send_email(state["contact_info"], "Information from Alinta Energy", state["last_response"])
                                     state["waiting_for"] = None
-                                    
-                                    # Let the AI know we've sent the email
                                     await inject_assistant_message(openai_ws, "I've sent the information to your email address. Is there anything else you need help with?")
 
                         # Handle AI response for detecting SMS/Email prompt
@@ -228,7 +220,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 "streamSid": stream_sid,
                                 "media": {"payload": audio_payload},
                             }
-                            # Use send_text with JSON stringified content instead of send_json
+                            # Convert to JSON string before sending
                             await websocket.send_text(json.dumps(audio_delta))
 
                         # Handle function calls for RAG
@@ -245,6 +237,7 @@ async def handle_media_stream(websocket: WebSocket):
                     import traceback
                     logger.error(traceback.format_exc())
 
+            # Run both coroutines concurrently
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
     except Exception as e:
