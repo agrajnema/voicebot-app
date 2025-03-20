@@ -52,10 +52,10 @@ async def handle_incoming_call(request: Request):
     response.say("Please wait while we connect your call.")
     response.pause(length=1)
     response.say("You can start talking now!")
-    #host = "voicebotrelay.servicebus.windows.net/PC05051" #request.url.hostname
     host = request.url.hostname
+    #host = request.url.hostname
     # if request.url.port:
-    #     host = f"{host}:{request.url.port}"
+    #      host = f"{host}:{request.url.port}"
     connect = Connect()
     print(f"wss://{host}/media-stream")
     connect.stream(url=f"wss://{host}/media-stream")
@@ -69,75 +69,87 @@ async def handle_media_stream(websocket: WebSocket):
 
     stream_sid = None
 
-    async with websockets.connect(
-        AZURE_OPENAI_API_ENDPOINT,
-        additional_headers={"api-key": AZURE_OPENAI_API_KEY},
-    ) as openai_ws:
-        await initialize_session(openai_ws)
+    try:
+        # Open connection to Azure OpenAI
+        async with websockets.connect(
+            AZURE_OPENAI_API_ENDPOINT,
+            additional_headers={"api-key": AZURE_OPENAI_API_KEY},
+        ) as openai_ws:
+            await initialize_session(openai_ws)
 
-        async def receive_from_twilio():
-            nonlocal stream_sid
-            try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
-                    if data["event"] == "media":
-                        audio_append = {
-                            "type": "input_audio_buffer.append",
-                            "audio": data["media"]["payload"],
-                        }
-                        await openai_ws.send(json.dumps(audio_append))
-                    elif data["event"] == "start":
-                        stream_sid = data["start"]["streamSid"]
-                        logger.info(f"Stream started with SID: {stream_sid}")
-            except WebSocketDisconnect:
-                logger.warning("WebSocket disconnected by client.")
-                if openai_ws.open:
-                    await openai_ws.close()
+            # Handle incoming messages from Twilio
+            async def receive_from_twilio():
+                nonlocal stream_sid
+                try:
+                    async for message in websocket.iter_text():
+                        data = json.loads(message)
+                        if data["event"] == "media":
+                            audio_append = {
+                                "type": "input_audio_buffer.append",
+                                "audio": data["media"]["payload"],
+                            }
+                            await openai_ws.send(json.dumps(audio_append))
+                        elif data["event"] == "start":
+                            stream_sid = data["start"]["streamSid"]
+                            logger.info(f"Stream started with SID: {stream_sid}")
+                        # Handle other Twilio events
+                        elif data["event"] == "mark":
+                            logger.info(f"Mark event received: {data}")
+                        elif data["event"] == "stop":
+                            logger.info(f"Stop event received, closing connection")
+                            return
+                except WebSocketDisconnect:
+                    logger.warning("WebSocket disconnected by client.")
+                except json.JSONDecodeError:
+                    logger.error("Received malformed JSON from Twilio")
+                except Exception as e:
+                    logger.error(f"Error in receive_from_twilio: {str(e)}")
+                finally:
+                    if openai_ws.open:
+                        await openai_ws.close()
 
-        async def send_to_twilio():
-            try:
-                current_query = ""
-                async for openai_message in openai_ws:
-                    response = json.loads(openai_message)
+            # Handle outgoing messages to Twilio
+            async def send_to_twilio():
+                try:
+                    current_query = ""
+                    async for openai_message in openai_ws:
+                        response = json.loads(openai_message)
 
-                    # Log OpenAI responses
-                    # logger.info(f"OpenAI Response: {response}")
+                        if response.get("type") == "response.audio.delta" and "delta" in response:
+                            current_query = response.get("text", "").strip()
+                            if current_query:
+                                logger.info(f"User query: {current_query}")
+                            audio_payload = base64.b64encode(
+                                base64.b64decode(response["delta"])
+                            ).decode("utf-8")
+                            audio_delta = {
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {"payload": audio_payload},
+                            }
+                            # Send as JSON - using the proper WebSocket method
+                            await websocket.send_text(json.dumps(audio_delta))
 
-                    if response.get("type") == "response.audio.delta" and "delta" in response:
-                        current_query = response.get("text", "").strip()
-                        if current_query:
-                            logger.info(f"User query: {current_query}")
-                        audio_payload = base64.b64encode(
-                            base64.b64decode(response["delta"])
-                        ).decode("utf-8")
-                        audio_delta = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": audio_payload},
-                        }
-                        await websocket.send_json(audio_delta)
+                        # Handle function calls for RAG
+                        if response.get("type") == "response.function_call_arguments.done":
+                            function_name = response["name"]
+                            if function_name == "get_additional_context":
+                                query = json.loads(response["arguments"]).get("query", "")
+                                search_results = azure_search_rag(query)
+                                logger.info(f"RAG Results: {search_results}")
+                                await send_function_output(openai_ws, response["call_id"], search_results)
+                except Exception as e:
+                    logger.error(f"Error in send_to_twilio: {str(e)}")
 
-                    # Handle function calls for RAG
-                    if response.get("type") == "response.function_call_arguments.done":
-                        function_name = response["name"]
-                        if function_name == "get_additional_context":
-                            query = json.loads(response["arguments"]).get("query", "")
-                            search_results = azure_search_rag(query)
-                            logger.info(f"RAG Results: {search_results}")
-                            await send_function_output(openai_ws, response["call_id"], search_results)
-
-                    # Trigger RAG search when input is committed
-                    if response.get("type") == "input_audio_buffer.committed":
-                        query = response.get("text", "").strip()
-                        # if query:
-                        #     logger.info(f"Triggering RAG search for query: {query}")
-                        #     await trigger_rag_search(openai_ws, query)
-                        # else:
-                        #     logger.warning("Received empty query; skipping RAG search.")
-            except Exception as e:
-                logger.error(f"Error in send_to_twilio: {e}")
-
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+            # Run both tasks concurrently
+            await asyncio.gather(receive_from_twilio(), send_to_twilio())
+    except Exception as e:
+        logger.error(f"WebSocket handler error: {str(e)}")
+    finally:
+        # Ensure we clean up properly
+        if not websocket.client_state == WebSocket.DISCONNECTED:
+            await websocket.close()
+        logger.info("WebSocket connection closed.")
 
 
 async def initialize_session(openai_ws):
@@ -151,11 +163,14 @@ async def initialize_session(openai_ws):
             "voice": VOICE,
             "instructions": (
                 "You are an AI assistant providing factual answers ONLY from the search. "
-                "When responding to a user query, first briefly reiterate what they asked in a concise format, then provide your answer. "
                 "If USER says hello Always respond with with Hello, I am Jason from Alinta Energy. How can I help you today? "
-                "Use the `get_additional_context` function to retrieve relevant information."
-                "Keep all your responses very consise and straight to point and not more than 30 words"
-                "If USER says Thank You,  Always respond with with You are welcome, Is there anything else I can help you with?"
+                "Use the `get_additional_context` function to retrieve relevant information. "
+                "Keep all your responses very concise and straight to point and not more than 30 words. "
+                "After providing any information, always ask: 'Would you like to receive this information via SMS or Email?' "
+                "If they choose SMS, ask for their mobile number. "
+                "If they choose Email, ask for their email address. "
+                "Once they provide these details, confirm you are sending the information and continue the conversation. "
+                "If USER says Thank You, Always respond with with You are welcome, Is there anything else I can help you with?"
             ),
             "tools": [
                 {
