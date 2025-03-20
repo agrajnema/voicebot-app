@@ -107,12 +107,11 @@ conversation_states = {}
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
-
     logger.info("WebSocket connection attempt from Twilio.")
     try:
-        await websocket.accept(subprotocols=["stream"])
+        # Remove the subprotocols parameter - not supported in FastAPI
+        await websocket.accept()
         logger.info("WebSocket connection successfully accepted.")
-
 
         stream_sid = None
         
@@ -134,7 +133,12 @@ async def handle_media_stream(websocket: WebSocket):
                 nonlocal stream_sid
                 try:
                     async for message in websocket.iter_text():
+                        # Log the raw message for debugging
+                        logger.debug(f"Raw message from Twilio: {message[:100]}...")
+                        
                         data = json.loads(message)
+                        logger.info(f"Received Twilio event: {data['event']}")
+                        
                         if data["event"] == "media":
                             audio_append = {
                                 "type": "input_audio_buffer.append",
@@ -148,10 +152,15 @@ async def handle_media_stream(websocket: WebSocket):
                                 conversation_states[stream_sid] = conversation_state
                 except WebSocketDisconnect:
                     logger.warning("WebSocket disconnected by client.")
-                    if openai_ws.open:
-                        await openai_ws.close()
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error from Twilio message: {e}")
+                except Exception as e:
+                    logger.error(f"Error in receive_from_twilio: {str(e)}")
+                finally:
                     if stream_sid and stream_sid in conversation_states:
                         del conversation_states[stream_sid]
+                    if openai_ws.open:
+                        await openai_ws.close()
 
             async def send_to_twilio():
                 try:
@@ -161,6 +170,7 @@ async def handle_media_stream(websocket: WebSocket):
                         # Handle input from user
                         if response.get("type") == "input_audio_buffer.committed":
                             user_input = response.get("text", "").strip().lower()
+                            logger.info(f"User input committed: {user_input}")
                             
                             # Process based on conversation state
                             if stream_sid and stream_sid in conversation_states:
@@ -199,12 +209,14 @@ async def handle_media_stream(websocket: WebSocket):
                         # Handle AI response for detecting SMS/Email prompt
                         if response.get("type") == "response.text.done":
                             full_response = response.get("text", "")
+                            logger.info(f"AI full response: {full_response}")
                             if stream_sid and stream_sid in conversation_states:
                                 conversation_states[stream_sid]["last_response"] = full_response
                                 
                                 # If the AI asked about SMS or Email, update state
                                 if "sms or email" in full_response.lower():
                                     conversation_states[stream_sid]["waiting_for"] = "sms_or_email"
+                                    logger.info("Detected SMS/Email prompt - waiting for user selection")
 
                         # Handle audio response
                         if response.get("type") == "response.audio.delta" and "delta" in response:
@@ -216,7 +228,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 "streamSid": stream_sid,
                                 "media": {"payload": audio_payload},
                             }
-                            await websocket.send_json(audio_delta)
+                            # Use send_text with JSON stringified content instead of send_json
+                            await websocket.send_text(json.dumps(audio_delta))
 
                         # Handle function calls for RAG
                         if response.get("type") == "response.function_call_arguments.done":
@@ -229,6 +242,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                 except Exception as e:
                     logger.error(f"Error in send_to_twilio: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
 
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
