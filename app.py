@@ -74,48 +74,39 @@ async def index_page():
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
-    """Handle incoming Twilio calls and set up the Media Stream"""
-    call_sid = None
-    try:
-        # Try to parse form data
-        form_data = await request.form()
-        call_sid = form_data.get("CallSid")
-    except RuntimeError as e:
-        # Handle case where python-multipart is not installed
-        logger.error(f"Form parsing error: {e}")
-        # Continue without form data
-    except Exception as e:
-        logger.error(f"Unexpected error parsing form: {e}")
+    """Handle incoming Twilio calls without form parsing"""
+    # Skip trying to parse form data
+    call_sid = "unknown"  # We won't have the CallSid but that's ok
     
-    logger.info(f"Incoming call received with SID: {call_sid or 'unknown'}")
+    logger.info(f"Incoming call received, skipping form parsing")
     
-    # Initialize call state if we have a call_sid
-    if call_sid:
-        active_calls[call_sid] = {
-            "last_response": "",
-            "waiting_for": None,
-            "contact_info": None,
-            "delivery_method": None,
-            "transcript": "",
-            "last_query": ""
-        }
+    # Initialize a generic call state
+    # We'll use a timestamp as a temporary ID
+    temp_call_id = f"call_{int(time.time())}"
+    active_calls[temp_call_id] = {
+        "last_response": "",
+        "waiting_for": None,
+        "contact_info": None,
+        "delivery_method": None,
+        "transcript": "",
+        "last_query": ""
+    }
     
     response = VoiceResponse()
     response.say("Please wait while we connect your call.")
     response.pause(length=1)
     
-    # Use MediaStream with a REST endpoint
-    connect = Connect()
-    media = connect.stream(name='Alinta Energy Voice Bot')
-    
-    # Set stream parameters
-    media.parameter(name="contentType", value="audio/x-mulaw")
-    
-    # Set callback URLs
+    # Get the public-facing hostname
     host = request.headers.get("X-Forwarded-Host", request.url.hostname)
     protocol = request.headers.get("X-Forwarded-Proto", "https")
     base_url = f"{protocol}://{host}"
     
+    # Set up the Media Stream
+    connect = Connect()
+    media = connect.stream(name='Alinta Energy Voice Bot')
+    
+    # Configure the stream
+    media.parameter(name="contentType", value="audio/x-mulaw")
     media.parameter(name="statusCallback", value=f"{base_url}/stream-status")
     media.parameter(name="track", value="inbound_track")
     media.parameter(name="url", value=f"{base_url}/media-stream")
