@@ -310,8 +310,7 @@ async def handle_media_stream(websocket: WebSocket):
                                         state["waiting_for"] = "mobile_collection"
                                         
                                         await inject_assistant_message(openai_ws, 
-                                            "Whilst you can do this online, I can send you an SMS with details. "
-                                            "Please say your mobile number.")
+                                            "Whilst you can do this online, I can text details. Please say your mobile number.")
 
                                     elif "email" in user_input_lower or "mail" in user_input_lower:
                                         logger.critical("EMAIL KEYWORD FOUND - SELECTING EMAIL")
@@ -765,9 +764,9 @@ async def initialize_session(openai_ws):
                 
                 "4. Then ask EXACTLY: 'To do this in a quick and easy way, would you like to receive the links by SMS or email?' and WAIT for their explicit choice.\n\n"
                 
-                "5. ONLY if the customer explicitly chooses email, say: 'Whilst you can do this online, I can send you an email with details. Please say your email address now.'\n\n"
+                "5. ONLY if the customer explicitly chooses email, say: 'Whilst you can do this online, I can email details. Please say your email.'\n\n"
                 
-                "6. ONLY if the customer explicitly chooses SMS, say: 'Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. Please say your complete mobile number now.'\n\n"
+                "6. ONLY if the customer explicitly chooses SMS, say: 'Whilst you can do this online, I can text details. Please say your mobile number.'\n\n"
                 
                 "7. When ending the call, say: 'Thanks for calling Alinta Energy.'\n\n"
                 
@@ -870,7 +869,7 @@ async def send_function_output(openai_ws, call_id, output):
 
 
 def azure_search_rag(query):
-    """Perform Azure Cognitive Search and return results."""
+    """Perform Azure Cognitive Search and return concise but complete results."""
     try:
         logger.info(f"Querying Azure Search with: {query}")
         results = search_client.search(
@@ -881,12 +880,41 @@ def azure_search_rag(query):
         )
         summarized_results = [doc.get("chunk", "No content available") for doc in results]
         if not summarized_results:
-            return "No relevant information found in Azure Search."
-        return "\n".join(summarized_results)
+            return "No relevant information found."
+            
+        # Create more concise results that complete full sentences
+        concise_results = []
+        for result in summarized_results:
+            # Split into sentences
+            import re
+            sentences = re.split(r'(?<=[.!?])\s+', result)
+            
+            # Keep adding sentences until we reach ~25-30 words
+            word_count = 0
+            final_text = []
+            
+            for sentence in sentences:
+                sentence_words = len(sentence.split())
+                if word_count + sentence_words <= 30:
+                    final_text.append(sentence)
+                    word_count += sentence_words
+                else:
+                    # If first sentence is already too long, take part of it
+                    if not final_text:
+                        words = sentence.split()
+                        final_text.append(" ".join(words[:25]) + "...")
+                    break
+                    
+                # Stop if we have a complete thought and are in the 20-30 word range
+                if 20 <= word_count <= 30:
+                    break
+                    
+            concise_results.append(" ".join(final_text))
+            
+        return "\n".join(concise_results)
     except Exception as e:
         logger.error(f"Error in Azure Search: {e}")
-        return "Error retrieving data from Azure Search."
-
+        return "Error retrieving data."
 
 
 # Add these helper functions
