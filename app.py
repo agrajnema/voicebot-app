@@ -304,40 +304,24 @@ async def handle_media_stream(websocket: WebSocket):
                                     logger.critical(f"SMS/EMAIL DETECTION - Character codes: {[ord(c) for c in user_input_lower]}")
                                     
                                     # ULTRA-SIMPLE detection - look for the exact strings only, nothing fancy
-                                    if "sms" in user_input_lower:
-                                        logger.critical("SMS KEYWORD 'sms' FOUND - SELECTING SMS")
+                                    if "sms" in user_input_lower or "text" in user_input_lower:
+                                        logger.critical("SMS KEYWORD FOUND - SELECTING SMS")
                                         state["delivery_method"] = "sms"
                                         state["waiting_for"] = "mobile_collection"
                                         
                                         await inject_assistant_message(openai_ws, 
-                                            "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
-                                            "Please say your complete mobile number now.")
-                                        
-                                    elif "text" in user_input_lower:
-                                        logger.critical("SMS KEYWORD 'text' FOUND - SELECTING SMS")
-                                        state["delivery_method"] = "sms"
-                                        state["waiting_for"] = "mobile_collection"
-                                        
-                                        await inject_assistant_message(openai_ws, 
-                                            "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
-                                            "Please say your complete mobile number now.")
-                                    
-                                    # Only check for email if no SMS keywords were found
+                                            "Whilst you can do this online, I can send you an SMS with details. "
+                                            "Please say your mobile number.")
+
                                     elif "email" in user_input_lower or "mail" in user_input_lower:
                                         logger.critical("EMAIL KEYWORD FOUND - SELECTING EMAIL")
                                         state["delivery_method"] = "email"
                                         state["waiting_for"] = "email_collection"
                                         
                                         await inject_assistant_message(openai_ws, 
-                                            "Please be advised that you would receive an email from Alinta energy. "
-                                            "You may also check your junk folder to look for the email. "
-                                            "Please say your complete email address now, saying 'at' for @ and 'dot' for period.")
-                                    
-                                    # If nothing matched clearly, ask again
-                                    else:
-                                        logger.critical(f"NO CLEAR SELECTION DETECTED in '{user_input_lower}'")
-                                        await inject_assistant_message(openai_ws, 
-                                            "I'm sorry, I didn't understand your choice. Please just say SMS or Email.")
+                                            "Whilst you can do this online, I can send you an email with details. "
+                                            "Please say your email address now.")
+                                        
                                                                 
                                 # Handle email collection
                                 elif state["waiting_for"] == "email_collection":
@@ -364,12 +348,8 @@ async def handle_media_stream(websocket: WebSocket):
                                         state["confirmed_email"] = email
                                         state["waiting_for"] = "confirm_email"
                                         
-                                        # Split the email at the @ symbol to spell out the username part
-                                        username, domain = email.split('@', 1)
-                                        spelled_username = " ".join(username)  # Spell each character in username
-                                        
-                                        # Format the full email for confirmation, with character-by-character for username
-                                        confirmation_message = f"I have your email as {spelled_username} at {domain}. Is that correct? Please say yes or no."
+                                        # Keep email exactly as captured, don't modify it
+                                        confirmation_message = f"Is {email} correct?"
                                         
                                         logger.critical(f"EMAIL COLLECTION - Confirmation message: '{confirmation_message}'")
                                         await inject_assistant_message(openai_ws, confirmation_message)
@@ -785,7 +765,7 @@ async def initialize_session(openai_ws):
                 
                 "4. Then ask EXACTLY: 'To do this in a quick and easy way, would you like to receive the links by SMS or email?' and WAIT for their explicit choice.\n\n"
                 
-                "5. ONLY if the customer explicitly chooses email, say: 'Please be advised that you would receive an email from Alinta energy. You may also check your junk folder to look for the email. Please say your complete email address now.'\n\n"
+                "5. ONLY if the customer explicitly chooses email, say: 'Whilst you can do this online, I can send you an email with details. Please say your email address now.'\n\n"
                 
                 "6. ONLY if the customer explicitly chooses SMS, say: 'Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. Please say your complete mobile number now.'\n\n"
                 
