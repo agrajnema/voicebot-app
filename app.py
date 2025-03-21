@@ -141,7 +141,8 @@ async def handle_media_stream(websocket: WebSocket):
             "confirmed_mobile": None,
             "disconnect_attempts": 0,
             "last_query": "",
-            "last_result": ""
+            "last_result": "",
+            "email_disclaimer_sent": False
         }
 
         # Connect to OpenAI with proper headers
@@ -328,7 +329,7 @@ async def handle_media_stream(websocket: WebSocket):
                                         state["waiting_for"] = "email_collection"
                                         
                                         await inject_assistant_message(openai_ws, 
-                                            "Please be advised that you would receive an email from Alinta energy from no-reply at alintaenergy dot com dot au. "
+                                            "Please be advised that you would receive an email from Alinta energy. "
                                             "You may also check your junk folder to look for the email. "
                                             "Please say your complete email address now, saying 'at' for @ and 'dot' for period.")
                                     
@@ -363,9 +364,12 @@ async def handle_media_stream(websocket: WebSocket):
                                         state["confirmed_email"] = email
                                         state["waiting_for"] = "confirm_email"
                                         
-                                        # Spell it out EXACTLY as captured
-                                        spelled_email = " ".join(email)  # Simple character by character spelling
-                                        confirmation_message = f"I have your email as {email}. Is that correct? Please say yes or no."
+                                        # Split the email at the @ symbol to spell out the username part
+                                        username, domain = email.split('@', 1)
+                                        spelled_username = " ".join(username)  # Spell each character in username
+                                        
+                                        # Format the full email for confirmation, with character-by-character for username
+                                        confirmation_message = f"I have your email as {spelled_username} at {domain}. Is that correct? Please say yes or no."
                                         
                                         logger.critical(f"EMAIL COLLECTION - Confirmation message: '{confirmation_message}'")
                                         await inject_assistant_message(openai_ws, confirmation_message)
@@ -781,7 +785,7 @@ async def initialize_session(openai_ws):
                 
                 "4. Then ask EXACTLY: 'To do this in a quick and easy way, would you like to receive the links by SMS or email?' and WAIT for their explicit choice.\n\n"
                 
-                "5. ONLY if the customer explicitly chooses email, say: 'Please be advised that you would receive an email from Alinta energy from no-reply at alintaenergy dot com dot au. You may also check your junk folder to look for the email. Please say your complete email address now.'\n\n"
+                "5. ONLY if the customer explicitly chooses email, say: 'Please be advised that you would receive an email from Alinta energy. You may also check your junk folder to look for the email. Please say your complete email address now.'\n\n"
                 
                 "6. ONLY if the customer explicitly chooses SMS, say: 'Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. Please say your complete mobile number now.'\n\n"
                 
