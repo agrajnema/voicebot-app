@@ -258,11 +258,34 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                                 # Handle "Is that right?" confirmation
                                 if "is that right" in state.get("last_response", "").lower() and not state.get("intent_confirmed", False):
-                                    if any(word in user_input for word in ["yes", "correct", "right", "yeah", "yep", "that's right"]):
+                                    logger.info(f"Processing intent confirmation. User said: '{user_input}'")
+                                    
+                                    # Check for affirmative response
+                                    if any(word in user_input.lower() for word in ["yes", "correct", "right", "yeah", "yep", "that's right"]):
                                         state["intent_confirmed"] = True
-                                        logger.info("User confirmed intent")
-                                    elif any(word in user_input for word in ["no", "incorrect", "wrong", "not right"]):
-                                        await inject_assistant_message(openai_ws, "I apologize for misunderstanding. Could you please explain again what you're looking for?")
+                                        logger.info("User CONFIRMED intent")
+                                        # Let the normal flow continue
+                                    
+                                    # Check for negative response
+                                    elif any(word in user_input.lower() for word in ["no", "incorrect", "wrong", "not right", "nope"]):
+                                        logger.info("User REJECTED intent - Interrupting AI and resetting flow")
+    
+                                        # Reset relevant state variables
+                                        state["intent_confirmed"] = False
+                                        state["last_query"] = ""
+                                        state["waiting_for"] = "clarification"
+                                        
+                                        # Use the new interruption function
+                                        success = await force_ai_interrupt(openai_ws, 
+                                            "I apologize for misunderstanding. Please tell me again what you're looking for, and I'll do my best to help.")
+                                        
+                                        if not success:
+                                            # Fallback to the old method if interruption fails
+                                            await inject_assistant_message(openai_ws, 
+                                                "I apologize for misunderstanding. Please tell me again what you're looking for, and I'll do my best to help.")
+                                        
+                                        # Critical: Return early to prevent any additional processing
+                                        return
                                 
                                 # Check if we need to update waiting_for state based on AI's last response
                                 if "would you like to receive the links by sms or email" in state.get("last_response", "").lower():
@@ -274,66 +297,51 @@ async def handle_media_stream(websocket: WebSocket):
                                     user_input_lower = user_input.lower().strip()
                                     logger.info(f"CRITICAL - Processing SMS/Email selection. Raw input: '{user_input}'")
                                     
-                                    # More specific pattern matching - put most explicit patterns first
-                                    direct_sms_keywords = ["sms", "text message", "texting"]
-                                    direct_email_keywords = ["email", "e-mail", "electronic mail"]
+                                    # Extremely simple and direct keyword detection with priority to SMS
+                                    is_sms = False
+                                    is_email = False
                                     
-                                    # Log each raw match for debugging
-                                    for keyword in direct_sms_keywords:
-                                        if keyword in user_input_lower:
-                                            logger.info(f"DIRECT SMS MATCH: '{keyword}' found in '{user_input_lower}'")
+                                    # First check: exact matches for "sms" as a standalone word
+                                    if re.search(r'\bsms\b', user_input_lower) or re.search(r'\btext\b', user_input_lower):
+                                        logger.info("EXACT SMS MATCH FOUND - Setting delivery method to SMS")
+                                        is_sms = True
+                                    # Second check: exact matches for "email" as a standalone word
+                                    elif re.search(r'\bemail\b', user_input_lower) or re.search(r'\bmail\b', user_input_lower):
+                                        logger.info("EXACT EMAIL MATCH FOUND - Setting delivery method to email")
+                                        is_email = True
+                                    # Third check: if no exact matches, try substring matching with priority to SMS
+                                    else:
+                                        sms_terms = ["sms", "text", "message"]
+                                        email_terms = ["email", "mail"]
+                                        
+                                        # Always check SMS first to give it priority
+                                        for term in sms_terms:
+                                            if term in user_input_lower:
+                                                logger.info(f"SMS SUBSTRING MATCH: '{term}' found")
+                                                is_sms = True
+                                                break
+                                                
+                                        # Only check email if SMS wasn't found
+                                        if not is_sms:
+                                            for term in email_terms:
+                                                if term in user_input_lower:
+                                                    logger.info(f"EMAIL SUBSTRING MATCH: '{term}' found")
+                                                    is_email = True
+                                                    break
                                     
-                                    for keyword in direct_email_keywords:
-                                        if keyword in user_input_lower:
-                                            logger.info(f"DIRECT EMAIL MATCH: '{keyword}' found in '{user_input_lower}'")
-                                    
-                                    # Simple explicit check first (to catch definite cases)
-                                    if any(keyword in user_input_lower for keyword in direct_sms_keywords):
-                                        logger.info("DIRECT SMS KEYWORD DETECTED - Setting delivery method to SMS")
+                                    # Take action based on detection
+                                    if is_sms:
                                         state["delivery_method"] = "sms"
                                         state["waiting_for"] = "mobile_collection"
+                                        logger.info("FINAL DECISION: SMS selected")
                                         
                                         await inject_assistant_message(openai_ws, 
                                             "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
                                             "Please say your complete mobile number now.")
-                                        return  # Exit early if direct match
-                                        
-                                    elif any(keyword in user_input_lower for keyword in direct_email_keywords):
-                                        logger.info("DIRECT EMAIL KEYWORD DETECTED - Setting delivery method to email")
+                                    elif is_email:
                                         state["delivery_method"] = "email"
                                         state["waiting_for"] = "email_collection"
-                                        
-                                        await inject_assistant_message(openai_ws, 
-                                            "Please be advised that you would receive an email from Alinta energy from no-reply at alintaenergy dot com dot au. "
-                                            "You may also check your junk folder to look for the email. "
-                                            "Please say your complete email address now, saying 'at' for @ and 'dot' for period.")
-                                        return  # Exit early if direct match
-                                    
-                                    # If no direct match, try broader patterns
-                                    sms_patterns = ["sms", "text", "message", "txt", "texting", "messaging", "s m s", 
-                                                    "s.m.s", "phone", "mobile", "cell"]
-                                    email_patterns = ["email", "mail", "e-mail", "electronic", "e mail", "gmail", 
-                                                    "inbox", "address"]
-                                    
-                                    # Count occurrences of each pattern type (for weighted decision)
-                                    sms_matches = sum(1 for pattern in sms_patterns if pattern in user_input_lower)
-                                    email_matches = sum(1 for pattern in email_patterns if pattern in email_patterns)
-                                    
-                                    logger.info(f"Pattern match counts: SMS={sms_matches}, Email={email_matches}")
-                                    
-                                    # Make decision based on which has more matches (with a bias toward SMS)
-                                    if sms_matches > 0:  # Prioritize SMS if any matches
-                                        logger.info("SMS PATTERN MATCHED - Setting delivery method to SMS")
-                                        state["delivery_method"] = "sms"
-                                        state["waiting_for"] = "mobile_collection"
-                                        
-                                        await inject_assistant_message(openai_ws, 
-                                            "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
-                                            "Please say your complete mobile number now.")
-                                    elif email_matches > 0:
-                                        logger.info("EMAIL PATTERN MATCHED - Setting delivery method to email")
-                                        state["delivery_method"] = "email"
-                                        state["waiting_for"] = "email_collection"
+                                        logger.info("FINAL DECISION: Email selected")
                                         
                                         await inject_assistant_message(openai_ws, 
                                             "Please be advised that you would receive an email from Alinta energy from no-reply at alintaenergy dot com dot au. "
@@ -341,13 +349,13 @@ async def handle_media_stream(websocket: WebSocket):
                                             "Please say your complete email address now, saying 'at' for @ and 'dot' for period.")
                                     elif any(word in user_input_lower for word in ["neither", "none", "no", "cancel"]):
                                         state["waiting_for"] = None
+                                        logger.info("FINAL DECISION: Neither selected")
                                         await inject_assistant_message(openai_ws, "No problem. Is there anything else I can help you with?")
                                     else:
                                         # If we can't determine the choice, ask again with clearer instructions
-                                        logger.warning(f"COULD NOT DETERMINE CHOICE from input: '{user_input_lower}'")
+                                        logger.warning(f"FINAL DECISION: Could not determine choice from '{user_input_lower}'")
                                         await inject_assistant_message(openai_ws, 
-                                            "I'm sorry, I didn't catch whether you wanted SMS or email. Please clearly say just 'SMS' or 'Email'.")
-
+                                            "I'm sorry, I didn't catch whether you wanted SMS or email. Please just say SMS or Email.")
                                                                 
                                 # Handle email collection
                                 elif state["waiting_for"] == "email_collection":
@@ -567,6 +575,57 @@ async def handle_media_stream(websocket: WebSocket):
             await websocket.close()
         logger.info("WebSocket connection closed")
 
+
+async def force_ai_interrupt(openai_ws, message):
+    """Force the AI to stop its current train of thought and respond with a new direction"""
+    try:
+        logger.info("Forcing AI interruption")
+        
+        # First, try to cancel any ongoing response
+        cancel_message = {
+            "type": "response.cancel"
+        }
+        await openai_ws.send(json.dumps(cancel_message))
+        
+        # Wait a moment for cancellation to process
+        await asyncio.sleep(0.2)
+        
+        # Insert a system message to guide the AI behavior
+        system_guidance = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "text", "text": 
+                    "The user has indicated the previous understanding was incorrect. "
+                    "Disregard previous context and start fresh with the user's new input."}]
+            }
+        }
+        await openai_ws.send(json.dumps(system_guidance))
+        
+        # Wait a moment for the system message to be processed
+        await asyncio.sleep(0.2)
+        
+        # Now send the actual message we want the AI to say
+        new_message = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": message}]
+            }
+        }
+        await openai_ws.send(json.dumps(new_message))
+        
+        # Prompt the AI to create a new response based on the updated context
+        await openai_ws.send(json.dumps({"type": "response.create"}))
+        
+        logger.info("AI interruption complete")
+        return True
+    except Exception as e:
+        logger.error(f"Error during AI interruption: {e}")
+        return False
+    
 def extract_first_char(text):
     """Try to extract the first character from various input formats"""
     # Check for common phrases like "a as in apple"
