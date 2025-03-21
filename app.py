@@ -274,49 +274,67 @@ async def handle_media_stream(websocket: WebSocket):
                                     user_input_lower = user_input.lower().strip()
                                     logger.info(f"CRITICAL - Processing SMS/Email selection. Raw input: '{user_input}'")
                                     
-                                    # Explicit debugging of each pattern match attempt
-                                    sms_patterns = ["sms", "text", "message", "txt", "texting", "messaging", "s m s"]
-                                    email_patterns = ["email", "mail", "e-mail", "electronic", "e mail", "gmail"]
+                                    # More specific pattern matching - put most explicit patterns first
+                                    direct_sms_keywords = ["sms", "text message", "texting"]
+                                    direct_email_keywords = ["email", "e-mail", "electronic mail"]
                                     
-                                    # Log detailed pattern matching results
-                                    for pattern in sms_patterns:
-                                        if pattern in user_input_lower:
-                                            logger.info(f"SMS MATCH FOUND: Pattern '{pattern}' detected in '{user_input_lower}'")
+                                    # Log each raw match for debugging
+                                    for keyword in direct_sms_keywords:
+                                        if keyword in user_input_lower:
+                                            logger.info(f"DIRECT SMS MATCH: '{keyword}' found in '{user_input_lower}'")
                                     
-                                    for pattern in email_patterns:
-                                        if pattern in user_input_lower:
-                                            logger.info(f"EMAIL MATCH FOUND: Pattern '{pattern}' detected in '{user_input_lower}'")
+                                    for keyword in direct_email_keywords:
+                                        if keyword in user_input_lower:
+                                            logger.info(f"DIRECT EMAIL MATCH: '{keyword}' found in '{user_input_lower}'")
                                     
-                                    # Super explicit SMS detection
-                                    is_sms = False
-                                    for sms_pattern in sms_patterns:
-                                        if sms_pattern in user_input_lower:
-                                            is_sms = True
-                                            break
-                                    
-                                    # Super explicit email detection
-                                    is_email = False
-                                    for email_pattern in email_patterns:
-                                        if email_pattern in user_input_lower:
-                                            is_email = True
-                                            break
-                                    
-                                    # Decision with priority to SMS if both are somehow detected
-                                    if is_sms:
-                                        logger.info("SMS SELECTION CONFIRMED - Setting delivery method to SMS")
+                                    # Simple explicit check first (to catch definite cases)
+                                    if any(keyword in user_input_lower for keyword in direct_sms_keywords):
+                                        logger.info("DIRECT SMS KEYWORD DETECTED - Setting delivery method to SMS")
                                         state["delivery_method"] = "sms"
                                         state["waiting_for"] = "mobile_collection"
                                         
-                                        # Force a clear SMS selection message to the OpenAI model
                                         await inject_assistant_message(openai_ws, 
                                             "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
                                             "Please say your complete mobile number now.")
-                                    elif is_email:
-                                        logger.info("EMAIL SELECTION CONFIRMED - Setting delivery method to email")
+                                        return  # Exit early if direct match
+                                        
+                                    elif any(keyword in user_input_lower for keyword in direct_email_keywords):
+                                        logger.info("DIRECT EMAIL KEYWORD DETECTED - Setting delivery method to email")
                                         state["delivery_method"] = "email"
                                         state["waiting_for"] = "email_collection"
                                         
-                                        # Fix pronunciation with phonetic spelling
+                                        await inject_assistant_message(openai_ws, 
+                                            "Please be advised that you would receive an email from Alinta energy from no-reply at alintaenergy dot com dot au. "
+                                            "You may also check your junk folder to look for the email. "
+                                            "Please say your complete email address now, saying 'at' for @ and 'dot' for period.")
+                                        return  # Exit early if direct match
+                                    
+                                    # If no direct match, try broader patterns
+                                    sms_patterns = ["sms", "text", "message", "txt", "texting", "messaging", "s m s", 
+                                                    "s.m.s", "phone", "mobile", "cell"]
+                                    email_patterns = ["email", "mail", "e-mail", "electronic", "e mail", "gmail", 
+                                                    "inbox", "address"]
+                                    
+                                    # Count occurrences of each pattern type (for weighted decision)
+                                    sms_matches = sum(1 for pattern in sms_patterns if pattern in user_input_lower)
+                                    email_matches = sum(1 for pattern in email_patterns if pattern in email_patterns)
+                                    
+                                    logger.info(f"Pattern match counts: SMS={sms_matches}, Email={email_matches}")
+                                    
+                                    # Make decision based on which has more matches (with a bias toward SMS)
+                                    if sms_matches > 0:  # Prioritize SMS if any matches
+                                        logger.info("SMS PATTERN MATCHED - Setting delivery method to SMS")
+                                        state["delivery_method"] = "sms"
+                                        state["waiting_for"] = "mobile_collection"
+                                        
+                                        await inject_assistant_message(openai_ws, 
+                                            "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
+                                            "Please say your complete mobile number now.")
+                                    elif email_matches > 0:
+                                        logger.info("EMAIL PATTERN MATCHED - Setting delivery method to email")
+                                        state["delivery_method"] = "email"
+                                        state["waiting_for"] = "email_collection"
+                                        
                                         await inject_assistant_message(openai_ws, 
                                             "Please be advised that you would receive an email from Alinta energy from no-reply at alintaenergy dot com dot au. "
                                             "You may also check your junk folder to look for the email. "
@@ -328,60 +346,62 @@ async def handle_media_stream(websocket: WebSocket):
                                         # If we can't determine the choice, ask again with clearer instructions
                                         logger.warning(f"COULD NOT DETERMINE CHOICE from input: '{user_input_lower}'")
                                         await inject_assistant_message(openai_ws, 
-                                            "I'm sorry, I didn't catch if you wanted SMS or email. Please clearly say only the word 'SMS' or the word 'Email'.")
-
+                                            "I'm sorry, I didn't catch whether you wanted SMS or email. Please clearly say just 'SMS' or 'Email'.")
 
                                                                 
                                 # Handle email collection
                                 elif state["waiting_for"] == "email_collection":
                                     logger.info(f"Processing email input: '{user_input}'")
-                                    # Get the full email in one go
-                                    if "at" in user_input or "@" in user_input:
-                                        # Try to extract an email address from the speech
-                                        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_input.replace(" at ", "@").replace(" dot ", "."))
-                                        
+    
+                                    # Prepare the input by replacing spoken forms with symbols
+                                    processed_input = user_input.lower().replace(" at ", "@").replace(" dot ", ".")
+                                    logger.info(f"Processed input for email extraction: '{processed_input}'")
+                                    
+                                    # Try to extract an email address
+                                    email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', processed_input)
+                                    
+                                    if email_match or "@" in processed_input:
+                                        # If regex matched or at least the @ symbol is present
                                         if email_match:
                                             email = email_match.group(0)
-                                            state["confirmed_email"] = email
-                                            state["waiting_for"] = "confirm_email"
-                                            
-                                            # Spell out the complete email for confirmation
-                                            spelled_email = spell_out_email(email)
-                                            await inject_assistant_message(openai_ws, 
-                                                f"I have your email as {spelled_email}. Is that correct? Please say yes or no.")
+                                            logger.info(f"Regex matched email: '{email}'")
                                         else:
-                                            # Try to construct an email from the spoken parts
-                                            parts = user_input.lower().split()
-                                            email_parts = []
-                                            domain_flag = False
+                                            # Try to construct from parts
+                                            parts = processed_input.split()
+                                            constructed = ""
+                                            for part in parts:
+                                                if "@" in part:
+                                                    # Handle case where @ is attached to domain or username
+                                                    at_parts = part.split("@")
+                                                    if len(at_parts) == 2:
+                                                        if constructed and not constructed.endswith("@"):
+                                                            constructed += "@" + at_parts[1]
+                                                        else:
+                                                            constructed += part
+                                                    else:
+                                                        constructed += part
+                                                else:
+                                                    constructed += part
                                             
-                                            for i, part in enumerate(parts):
-                                                if part == "at" or part == "@":
-                                                    domain_flag = True
-                                                    email_parts.append("@")
-                                                elif part == "dot" or part == ".":
-                                                    email_parts.append(".")
-                                                elif not domain_flag and part.isalnum():
-                                                    email_parts.append(part)
-                                                elif domain_flag and "." in part:
-                                                    email_parts.append(part)
-                                            
-                                            constructed_email = ''.join(email_parts)
-                                            if "@" in constructed_email and "." in constructed_email.split("@")[1]:
-                                                state["confirmed_email"] = constructed_email
-                                                state["waiting_for"] = "confirm_email"
-                                                
-                                                spelled_email = spell_out_email(constructed_email)
-                                                await inject_assistant_message(openai_ws, 
-                                                    f"I have your email as {spelled_email}. Is that correct? Please say yes or no.")
-                                            else:
-                                                await inject_assistant_message(openai_ws, 
-                                                    "I couldn't quite capture your email address. Please say your complete email address again, "
-                                                    "speaking slowly and clearly. For example, 'john at example dot com'.")
+                                            email = constructed
+                                            logger.info(f"Constructed email from parts: '{email}'")
+                                        
+                                        state["confirmed_email"] = email
+                                        state["waiting_for"] = "confirm_email"
+                                        
+                                        # Spell out the complete email for confirmation
+                                        spelled_email = spell_out_email(email)
+                                        logger.info(f"Confirmation message prepared with email: '{spelled_email}'")
+                                        
+                                        # Make the confirmation message explicit and clear
+                                        confirmation_msg = f"I have your email as {spelled_email}. Is that correct? Please say yes or no."
+                                        await inject_assistant_message(openai_ws, confirmation_msg)
                                     else:
+                                        # No email detected, ask again with clearer instructions
+                                        logger.warning(f"No valid email pattern detected in: '{user_input}'")
                                         await inject_assistant_message(openai_ws, 
-                                            "I didn't catch a valid email address. Please say your complete email address, "
-                                            "saying 'at' for @ and 'dot' for the period. For example, 'john at example dot com'.")
+                                            "I couldn't recognize a valid email address. Please say your complete email address, "
+                                            "saying 'at' for @ and 'dot' for period. For example, 'john at example dot com'.")
 
                                 # Handle mobile number collection
                                 elif state["waiting_for"] == "mobile_collection":
