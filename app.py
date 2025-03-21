@@ -271,34 +271,66 @@ async def handle_media_stream(websocket: WebSocket):
 
                                 # Process different conversation states
                                 if state["waiting_for"] == "sms_or_email":
-                                    logger.info(f"Processing SMS/Email selection from user input: '{user_input}'")
+                                    user_input_lower = user_input.lower().strip()
+                                    logger.info(f"CRITICAL - Processing SMS/Email selection. Raw input: '{user_input}'")
                                     
-                                    # More aggressive pattern matching for SMS
+                                    # Explicit debugging of each pattern match attempt
                                     sms_patterns = ["sms", "text", "message", "txt", "texting", "messaging", "s m s"]
                                     email_patterns = ["email", "mail", "e-mail", "electronic", "e mail", "gmail"]
                                     
-                                    if any(pattern in user_input for pattern in sms_patterns):
-                                        logger.info("SMS option selected")
+                                    # Log detailed pattern matching results
+                                    for pattern in sms_patterns:
+                                        if pattern in user_input_lower:
+                                            logger.info(f"SMS MATCH FOUND: Pattern '{pattern}' detected in '{user_input_lower}'")
+                                    
+                                    for pattern in email_patterns:
+                                        if pattern in user_input_lower:
+                                            logger.info(f"EMAIL MATCH FOUND: Pattern '{pattern}' detected in '{user_input_lower}'")
+                                    
+                                    # Super explicit SMS detection
+                                    is_sms = False
+                                    for sms_pattern in sms_patterns:
+                                        if sms_pattern in user_input_lower:
+                                            is_sms = True
+                                            break
+                                    
+                                    # Super explicit email detection
+                                    is_email = False
+                                    for email_pattern in email_patterns:
+                                        if email_pattern in user_input_lower:
+                                            is_email = True
+                                            break
+                                    
+                                    # Decision with priority to SMS if both are somehow detected
+                                    if is_sms:
+                                        logger.info("SMS SELECTION CONFIRMED - Setting delivery method to SMS")
                                         state["delivery_method"] = "sms"
                                         state["waiting_for"] = "mobile_collection"
+                                        
+                                        # Force a clear SMS selection message to the OpenAI model
                                         await inject_assistant_message(openai_ws, 
                                             "Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. "
                                             "Please say your complete mobile number now.")
-                                    elif any(pattern in user_input for pattern in email_patterns):
-                                        logger.info("Email option selected")
+                                    elif is_email:
+                                        logger.info("EMAIL SELECTION CONFIRMED - Setting delivery method to email")
                                         state["delivery_method"] = "email"
                                         state["waiting_for"] = "email_collection"
+                                        
+                                        # Fix pronunciation with phonetic spelling
                                         await inject_assistant_message(openai_ws, 
-                                            "Please be advised that you would receive an email from Alinta energy from noreply@alintaenergy.com.au. "
+                                            "Please be advised that you would receive an email from Alinta energy from no-reply at alintaenergy dot com dot au. "
                                             "You may also check your junk folder to look for the email. "
                                             "Please say your complete email address now, saying 'at' for @ and 'dot' for period.")
-                                    elif any(word in user_input for word in ["neither", "none", "no", "cancel"]):
+                                    elif any(word in user_input_lower for word in ["neither", "none", "no", "cancel"]):
                                         state["waiting_for"] = None
                                         await inject_assistant_message(openai_ws, "No problem. Is there anything else I can help you with?")
                                     else:
-                                        # If we can't determine the choice, ask again
+                                        # If we can't determine the choice, ask again with clearer instructions
+                                        logger.warning(f"COULD NOT DETERMINE CHOICE from input: '{user_input_lower}'")
                                         await inject_assistant_message(openai_ws, 
-                                            "I'm sorry, I didn't catch if you wanted SMS or email. Please clearly say either 'SMS' or 'Email'.")
+                                            "I'm sorry, I didn't catch if you wanted SMS or email. Please clearly say only the word 'SMS' or the word 'Email'.")
+
+
                                                                 
                                 # Handle email collection
                                 elif state["waiting_for"] == "email_collection":
@@ -696,16 +728,28 @@ async def initialize_session(openai_ws):
             "voice": VOICE,
             "instructions": (
                 "You are Jason from Alinta Energy providing customer support. Follow this exact conversation flow:\n\n"
-                "1. ALWAYS START by saying exactly: 'Welcome to Alinta Energy. In a few words, please tell me the reason for your call.'\n\n"
-                "2. When the customer explains their reason for calling, provide a concise summary of what they're asking and then say 'Is that right?'\n\n"
+                
+                "1. ALWAYS START by saying exactly: 'Welcome to Alinta Energy. In a few words, please tell me the reason for your call.' Then WAIT for the customer to respond. DO NOT continue until they've told you their reason.\n\n"
+                
+                "2. AFTER the customer explains their reason, respond with: 'I understand you would like to [brief summary of their request]. Is that right?' NEVER assume what they want - only summarize what they actually said.\n\n"
+                
                 "3. After the customer confirms, provide a brief response using information from the search function.\n\n"
-                "4. Then ALWAYS ask EXACTLY: 'To do this in a quick and easy way, would you like to receive the links by SMS or email?' and STOP TALKING. Do not continue speaking until the customer responds with their preference.\n\n"
-                "5. ONLY AFTER the customer explicitly chooses email, say: 'Please be advised that you would receive an email from Alinta energy from noreply@alintaenergy.com.au. You may also check your junk folder to look for the email. Please say your complete email address now, saying \"at\" for @ and \"dot\" for period.'\n\n"
-                "6. ONLY AFTER the customer explicitly chooses SMS, say: 'Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. Please say your complete mobile number now.'\n\n"
-                "7. When ending the call, always say: 'Thanks for calling Alinta Energy.'\n\n"
-                "Keep all responses concise and straight to the point, not more than 30-50 words.\n"
-                "Use the get_additional_context function to retrieve information for customer queries.\n"
-                "CRITICAL: After asking if the customer wants SMS or email, you MUST wait for their explicit choice before continuing."
+                
+                "4. Then ask EXACTLY: 'To do this in a quick and easy way, would you like to receive the links by SMS or email?' and WAIT for their explicit choice.\n\n"
+                
+                "5. ONLY if the customer explicitly chooses email, say: 'Please be advised that you would receive an email from Alinta energy from no-reply at alintaenergy dot com dot au. You may also check your junk folder to look for the email. Please say your complete email address now.'\n\n"
+                
+                "6. ONLY if the customer explicitly chooses SMS, say: 'Please be advised that you would receive an SMS from Alinta energy from a mobile number ending 000. Please say your complete mobile number now.'\n\n"
+                
+                "7. When ending the call, say: 'Thanks for calling Alinta Energy.'\n\n"
+                
+                "Additional instructions:\n"
+                "- Keep all responses concise and to the point.\n"
+                "- Always WAIT for customer input after asking a question.\n"
+                "- NEVER make assumptions about what the customer wants.\n"
+                "- Pronounce 'noreply@alintaenergy.com.au' as 'no-reply at alinta energy dot com dot au'.\n"
+                "- Speak at a measured pace, don't rush your words.\n"
+                "- Respect the customer's explicit choice between SMS and email."
             ),
             "tools": [
                 {
