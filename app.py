@@ -911,7 +911,7 @@ async def end_call_with_delay(call_sid, delay_seconds=2):
         except Exception as e3:
             logger.error(f"All call termination methods failed: {e3}")
             
-            
+
 async def initialize_session(openai_ws):
     """Initialize the OpenAI session with instructions and tools."""
     session_update = {
@@ -1320,6 +1320,7 @@ async def handle_email_username_input(user_input, state, openai_ws):
     await inject_assistant_message(openai_ws, 
         f"Added '{char_added}'. Your email so far is {spell_out_email(email_so_far)}. "
         f"Please say the next character or 'done' if complete.")
+    
 
 if __name__ == "__main__":
     import uvicorn
