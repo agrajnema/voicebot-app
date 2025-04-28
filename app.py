@@ -17,6 +17,10 @@ from email.message import EmailMessage
 from twilio.rest import Client
 import re, datetime, sys, time
 
+from azure.monitor.opentelemetry import configure_azure_monitor
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
 load_dotenv()
 
 # Configuration
@@ -26,8 +30,11 @@ AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
 AZURE_SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
 AZURE_SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX")
 AZURE_SEARCH_SEMANTIC_CONFIGURATION = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIGURATION")
+AZURE_LOG_CONNECTION_STRING = os.getenv("AZURE_LOG_CONNECTION_STRING")
+
 PORT = int(os.getenv("PORT", 5050))
 VOICE = "alloy"
+
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -55,6 +62,21 @@ search_client = SearchClient(
     endpoint=AZURE_SEARCH_ENDPOINT, index_name=AZURE_SEARCH_INDEX, credential=credential
 )
 
+# Configure Azure Monitor if connection string is available
+if AZURE_LOG_CONNECTION_STRING:
+    try:
+        configure_azure_monitor(
+            connection_string=AZURE_LOG_CONNECTION_STRING,
+        )
+        tracer = trace.get_tracer("alinta-voicebot")
+        logger.info("Azure Log Analytics configured successfully")
+    except Exception as e:
+        logger.error(f"Failed to configure Azure Log Analytics: {e}")
+        tracer = None
+else:
+    logger.warning("Azure Log Analytics connection string not provided")
+    tracer = None
+
 # FastAPI App
 app = FastAPI()
 
@@ -72,7 +94,7 @@ app.add_middleware(
 
 # Create a function for live streaming conversation events
 def stream_conversation(direction, text, call_sid=None):
-    """Stream conversation events to console in real-time with colorized output"""
+    """Stream conversation events to console and Azure Log Stream in real-time"""
     timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     call_info = f"[Call: {call_sid}] " if call_sid else ""
     
@@ -82,22 +104,41 @@ def stream_conversation(direction, text, call_sid=None):
     YELLOW = "\033[93m"
     RESET = "\033[0m"
     
+    # Format the message based on direction
     if direction == "user":
-        # User speech (voice to text) - Blue
-        print(f"{BLUE}{timestamp} {call_info}USER → SYSTEM: {text}{RESET}", flush=True)
+        log_message = f"{call_info}USER → SYSTEM: {text}"
+        print(f"{BLUE}{timestamp} {log_message}{RESET}", flush=True)
     elif direction == "system":
-        # AI response (text to voice) - Green
-        print(f"{GREEN}{timestamp} {call_info}SYSTEM → USER: {text}{RESET}", flush=True)
+        log_message = f"{call_info}SYSTEM → USER: {text}"
+        print(f"{GREEN}{timestamp} {log_message}{RESET}", flush=True)
     elif direction == "system-partial":
-        # Partial AI response (incremental text) - Yellow
-        print(f"{YELLOW}{timestamp} {call_info}SYSTEM (typing): {text}{RESET}", flush=True)
+        log_message = f"{call_info}SYSTEM (typing): {text}"
+        print(f"{YELLOW}{timestamp} {log_message}{RESET}", flush=True)
     else:
-        # Other events
-        print(f"{timestamp} {call_info}{direction}: {text}", flush=True)
+        log_message = f"{call_info}{direction}: {text}"
+        print(f"{timestamp} {log_message}", flush=True)
     
-    # Also log to file for permanent record
+    # Log to file for permanent record
     conversation_logger = logging.getLogger("conversation")
     conversation_logger.info(f"{call_info}[{direction}] {text}")
+    
+    # Send to Azure Log Analytics if configured
+    if tracer and call_sid:
+        with tracer.start_as_current_span(f"conversation-{direction}") as span:
+            # Add relevant attributes
+            span.set_attribute("call_sid", call_sid)
+            span.set_attribute("direction", direction)
+            span.set_attribute("message", text)
+            span.set_attribute("timestamp", timestamp)
+            
+            # Set status based on direction (for potential error tracking)
+            span.set_status(Status(StatusCode.OK))
+            
+            # Add additional context if needed
+            if direction == "user":
+                span.add_event("user_speech", {"text": text})
+            elif direction == "system":
+                span.add_event("system_response", {"text": text})
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -227,6 +268,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 if "." in stream_sid:
                                     call_sid = stream_sid.split('.')[0]
                                     logger.info(f"Extracted call SID: {call_sid}")
+                                    # Start conversation tracking in Azure
+                                    track_complete_conversation(call_sid)
                                 
                                 logger.info(f"Stream started with SID: {stream_sid}")
                                 
@@ -270,6 +313,11 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                                 # Stream user speech in real-time
                                 stream_conversation("user", user_input, call_sid)
+                                # Also log to Azure with more detail
+                                log_conversation_to_azure(call_sid, "user", user_input, {
+                                    "flow_stage": state.get("flow_stage", "unknown"),
+                                    "waiting_for": state.get("waiting_for", "unknown")
+                                })
 
                                 if not stream_sid or stream_sid not in conversation_states:
                                     logger.warning("No active conversation state found")
@@ -501,6 +549,11 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                                 # Stream the complete response
                                 stream_conversation("system", full_response, call_sid)
+
+                                log_conversation_to_azure(call_sid, "system", full_response, {
+                                    "flow_stage": state.get("flow_stage", "unknown"),
+                                    "waiting_for": state.get("waiting_for", "unknown")
+                                })
                                 
                                 if stream_sid and stream_sid in conversation_states:
                                     state = conversation_states[stream_sid]
@@ -579,6 +632,62 @@ async def handle_media_stream(websocket: WebSocket):
             await websocket.close()
         logger.info("WebSocket connection closed")
 
+def log_conversation_to_azure(call_sid, direction, text, metadata=None):
+    """Send detailed conversation logs to Azure Log Analytics"""
+    if not tracer or not call_sid:
+        return
+        
+    # Create a more detailed span with conversation-specific attributes
+    with tracer.start_as_current_span("voice_conversation") as span:
+        # Basic attributes
+        span.set_attribute("call_sid", call_sid)
+        span.set_attribute("direction", direction)
+        span.set_attribute("message", text)
+        span.set_attribute("timestamp", datetime.datetime.now().isoformat())
+        
+        # Add any additional metadata
+        if metadata:
+            for key, value in metadata.items():
+                span.set_attribute(key, str(value))
+        
+        # Add conversation-specific events
+        if direction == "user":
+            span.add_event("user_speech", {"text": text})
+        elif direction == "system":
+            span.add_event("system_response", {"text": text})
+        elif direction == "system-partial":
+            span.add_event("system_typing", {"text": text})
+        
+        # Add the event to track full conversation flow
+        conversation_event_name = f"{direction}_message"
+        span.add_event(conversation_event_name, {"call_sid": call_sid, "text": text})
+
+def track_complete_conversation(call_sid):
+    """Start tracking a complete conversation for a call"""
+    if not tracer or not call_sid:
+        return None
+        
+    # Create a parent span for the entire call
+    span = tracer.start_span(f"call_{call_sid}")
+    span.set_attribute("call_sid", call_sid)
+    span.set_attribute("start_time", datetime.datetime.now().isoformat())
+    
+    # Store the span so we can access it later
+    if not hasattr(app, 'call_spans'):
+        app.call_spans = {}
+    app.call_spans[call_sid] = span
+    
+    return span
+
+def end_conversation_tracking(call_sid):
+    """End tracking of a complete conversation"""
+    if not hasattr(app, 'call_spans') or call_sid not in app.call_spans:
+        return
+        
+    # Get the span and end it
+    span = app.call_spans.pop(call_sid)
+    span.set_attribute("end_time", datetime.datetime.now().isoformat())
+    span.end()
 
 async def force_ai_interrupt(openai_ws, message):
     """Force the AI to stop its current train of thought and respond with a new direction"""
@@ -766,6 +875,8 @@ async def end_call_with_delay(call_sid, delay_seconds=2):
     logger.info(f"Will end call {call_sid} after {delay_seconds} seconds")
     await asyncio.sleep(delay_seconds)
     
+    end_conversation_tracking(call_sid)
+
     try:
         # Use Twilio client to end the call
         logger.info(f"Attempting to end call {call_sid}")

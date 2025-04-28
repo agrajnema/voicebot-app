@@ -7,3 +7,7 @@ azure-search-documents==11.4.0
 python-dotenv==1.0.0
 uvicorn==0.22.0
 python-multipart
+
+azure-monitor-opentelemetry>=1.0.0
+opentelemetry-api>=1.11.1
+opentelemetry-sdk>=1.11.1
