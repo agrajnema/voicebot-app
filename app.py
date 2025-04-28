@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 import smtplib
 from email.message import EmailMessage
 from twilio.rest import Client
-import re
+import re, datetime, sys, time
 
 load_dotenv()
 
@@ -69,6 +69,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Create a function for live streaming conversation events
+def stream_conversation(direction, text, call_sid=None):
+    """Stream conversation events to console in real-time with colorized output"""
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    call_info = f"[Call: {call_sid}] " if call_sid else ""
+    
+    # ANSI color codes for better visibility
+    BLUE = "\033[94m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RESET = "\033[0m"
+    
+    if direction == "user":
+        # User speech (voice to text) - Blue
+        print(f"{BLUE}{timestamp} {call_info}USER → SYSTEM: {text}{RESET}", flush=True)
+    elif direction == "system":
+        # AI response (text to voice) - Green
+        print(f"{GREEN}{timestamp} {call_info}SYSTEM → USER: {text}{RESET}", flush=True)
+    elif direction == "system-partial":
+        # Partial AI response (incremental text) - Yellow
+        print(f"{YELLOW}{timestamp} {call_info}SYSTEM (typing): {text}{RESET}", flush=True)
+    else:
+        # Other events
+        print(f"{timestamp} {call_info}{direction}: {text}", flush=True)
+    
+    # Also log to file for permanent record
+    conversation_logger = logging.getLogger("conversation")
+    conversation_logger.info(f"{call_info}[{direction}] {text}")
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -239,6 +268,9 @@ async def handle_media_stream(websocket: WebSocket):
                                 user_input = response.get("text", "").strip().lower()
                                 logger.info(f"User input committed: '{user_input}'")
                                 
+                                # Stream user speech in real-time
+                                stream_conversation("user", user_input, call_sid)
+
                                 if not stream_sid or stream_sid not in conversation_states:
                                     logger.warning("No active conversation state found")
                                     continue
@@ -441,10 +473,34 @@ async def handle_media_stream(websocket: WebSocket):
                                         await inject_assistant_message(openai_ws, 
                                             "Let's try again. Please say your complete mobile number.")
                             
+                             # Handle AI response text (TEXT TO VOICE) - delta events for streaming
+                            elif response_type == "response.text.delta":
+                                # Collect partial responses
+                                delta_text = response.get("delta", "")
+                                if delta_text:
+                                    partial_text_buffer += delta_text
+                                    
+                                    # Show partial updates but not too frequently (every 100ms)
+                                    current_time = time.time()
+                                    if current_time - last_partial_update > 0.1:
+                                        stream_conversation("system-partial", partial_text_buffer, call_sid)
+                                        last_partial_update = current_time
+                                        partial_text_buffer = ""  # Reset buffer after displaying
+                                        
+                                    # Also store in state for context
+                                    if stream_sid and stream_sid in conversation_states:
+                                        state = conversation_states[stream_sid]
+                                        if "current_response" not in state:
+                                            state["current_response"] = ""
+                                        state["current_response"] += delta_text
+                                        
                             # Handle AI response text
                             elif response_type == "response.text.done":
                                 full_response = response.get("text", "")
                                 logger.info(f"AI full response: {full_response}")
+                                
+                                # Stream the complete response
+                                stream_conversation("system", full_response, call_sid)
                                 
                                 if stream_sid and stream_sid in conversation_states:
                                     state = conversation_states[stream_sid]
@@ -917,9 +973,11 @@ def azure_search_rag(query):
         return "Error retrieving data."
 
 
-# Add these helper functions
-async def inject_assistant_message(openai_ws, message):
+async def inject_assistant_message(openai_ws, message, call_sid=None):
     """Inject a message into the conversation as if it came from the assistant."""
+    # Stream the injected message
+    stream_conversation("system-injected", message, call_sid)
+    
     inject_message = {
         "type": "conversation.item.create",
         "item": {
@@ -932,6 +990,7 @@ async def inject_assistant_message(openai_ws, message):
     
     # Prompt OpenAI to continue processing
     await openai_ws.send(json.dumps({"type": "response.create"}))
+
 
 async def send_sms(phone_number, message):
     """Send SMS using Twilio with improved error handling."""
