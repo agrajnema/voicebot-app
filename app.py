@@ -911,6 +911,7 @@ async def end_call_with_delay(call_sid, delay_seconds=2):
         except Exception as e3:
             logger.error(f"All call termination methods failed: {e3}")
             
+            
 async def initialize_session(openai_ws):
     """Initialize the OpenAI session with instructions and tools."""
     session_update = {
