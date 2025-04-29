@@ -267,6 +267,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 # Extract call_sid from stream_sid
                                 if "." in stream_sid:
                                     call_sid = stream_sid.split('.')[0]
+                                    # Log the call_sid prominently to easily find it for transcript searches
+                                    logger.critical(f"CALL_SID_FOR_TRANSCRIPT_SEARCH: {call_sid}")
                                     logger.info(f"Extracted call SID: {call_sid}")
                                     # Start conversation tracking in Azure
                                     track_complete_conversation(call_sid)
@@ -278,6 +280,9 @@ async def handle_media_stream(websocket: WebSocket):
                                     conversation_states[stream_sid] = conversation_state
                             elif event_type == "stop":
                                 logger.info("Received stop event from Twilio")
+                                # Save complete transcript before cleanup
+                                if call_sid:
+                                    save_complete_transcript(call_sid)
                                 # Cleanup on stop event
                                 if stream_sid and stream_sid in conversation_states:
                                     del conversation_states[stream_sid]
@@ -288,11 +293,17 @@ async def handle_media_stream(websocket: WebSocket):
                             logger.error(f"Missing key in Twilio message: {e}")
                 except WebSocketDisconnect:
                     logger.warning("WebSocket disconnected by client.")
+                    # Save transcript on disconnect
+                    if call_sid:
+                        save_complete_transcript(call_sid)
                 except Exception as e:
                     logger.error(f"Error in receive_from_twilio: {str(e)}")
                     import traceback
                     logger.error(traceback.format_exc())
                 finally:
+                    # Save transcript before cleaning up
+                    if call_sid:
+                        save_complete_transcript(call_sid)
                     # Clean up
                     if stream_sid and stream_sid in conversation_states:
                         del conversation_states[stream_sid]
@@ -300,6 +311,10 @@ async def handle_media_stream(websocket: WebSocket):
 
             # Function to handle sending to Twilio
             async def send_to_twilio():
+                # Initialize buffer for partial text updates
+                partial_text_buffer = ""
+                last_partial_update = time.time()
+                
                 try:
                     async for openai_message in openai_ws:
                         try:
@@ -313,6 +328,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                                 # Stream user speech in real-time
                                 stream_conversation("user", user_input, call_sid)
+                                # Add to complete transcript
+                                add_to_conversation_transcript(call_sid, "user", user_input)
                                 # Also log to Azure with more detail
                                 log_conversation_to_azure(call_sid, "user", user_input, {
                                     "flow_stage": state.get("flow_stage", "unknown"),
@@ -350,7 +367,7 @@ async def handle_media_stream(websocket: WebSocket):
                                     # Check for negative response
                                     elif any(word in user_input.lower() for word in ["no", "incorrect", "wrong", "not right", "nope"]):
                                         logger.info("User REJECTED intent - Interrupting AI and resetting flow")
-    
+
                                         # Reset relevant state variables
                                         state["intent_confirmed"] = False
                                         state["last_query"] = ""
@@ -400,8 +417,7 @@ async def handle_media_stream(websocket: WebSocket):
                                         await inject_assistant_message(openai_ws, 
                                             "Whilst you can do this online, I can send you an email with details. "
                                             "Please say your email address now.")
-                                        
-                                                                
+                                                                    
                                 # Handle email collection
                                 elif state["waiting_for"] == "email_collection":
                                     # Log the exact input received for debugging
@@ -521,7 +537,7 @@ async def handle_media_stream(websocket: WebSocket):
                                         await inject_assistant_message(openai_ws, 
                                             "Let's try again. Please say your complete mobile number.")
                             
-                             # Handle AI response text (TEXT TO VOICE) - delta events for streaming
+                            # Handle AI response text (TEXT TO VOICE) - delta events for streaming
                             elif response_type == "response.text.delta":
                                 # Collect partial responses
                                 delta_text = response.get("delta", "")
@@ -549,6 +565,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 
                                 # Stream the complete response
                                 stream_conversation("system", full_response, call_sid)
+                                # Add to complete transcript
+                                add_to_conversation_transcript(call_sid, "system", full_response)
 
                                 log_conversation_to_azure(call_sid, "system", full_response, {
                                     "flow_stage": state.get("flow_stage", "unknown"),
@@ -573,6 +591,8 @@ async def handle_media_stream(websocket: WebSocket):
                                         # Check for ending message and disconnect call
                                         if "thanks for calling alinta energy" in full_response.lower():
                                             logger.info("Detected call ending message, will terminate call")
+                                            # Make sure to save the transcript before ending the call
+                                            save_complete_transcript(call_sid)
                                             asyncio.create_task(end_call_with_delay(call_sid, 2))
                             
                             # Handle audio response
@@ -609,28 +629,20 @@ async def handle_media_stream(websocket: WebSocket):
                     logger.error(f"Error in send_to_twilio: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
+                finally:
+                    # Make sure we save the transcript before exiting
+                    if call_sid:
+                        save_complete_transcript(call_sid)
 
-            # Run both coroutines concurrently
-            await asyncio.gather(receive_from_twilio(), send_to_twilio())
-        
+        except Exception as e:
+            logger.error(f"Critical WebSocket error: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
         finally:
-            # Ensure all tasks are cleaned up
-            if 'greeting_task' in locals() and not greeting_task.done():
-                greeting_task.cancel()
-                
-            # Ensure OpenAI connection is closed properly
-            await openai_ws.close()
-            logger.info("OpenAI connection closed")
-
-    except Exception as e:
-        logger.error(f"Critical WebSocket error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-    finally:
-        # Clean up WebSocket connection
-        if not websocket.client_state == WebSocket.DISCONNECTED:
-            await websocket.close()
-        logger.info("WebSocket connection closed")
+            # Clean up WebSocket connection
+            if not websocket.client_state == WebSocket.DISCONNECTED:
+                await websocket.close()
+            logger.info("WebSocket connection closed")
 
 def log_conversation_to_azure(call_sid, direction, text, metadata=None):
     """Send detailed conversation logs to Azure Log Analytics"""
@@ -664,30 +676,39 @@ def log_conversation_to_azure(call_sid, direction, text, metadata=None):
 
 def track_complete_conversation(call_sid):
     """Start tracking a complete conversation for a call"""
-    if not tracer or not call_sid:
+    if not call_sid:
         return None
+    
+    # Initialize transcript
+    initialize_conversation_transcript(call_sid)
+    
+    # Also create a span for the call if tracer is available
+    if tracer:
+        span = tracer.start_span(f"call_{call_sid}")
+        span.set_attribute("call_sid", call_sid)
+        span.set_attribute("start_time", datetime.datetime.now().isoformat())
         
-    # Create a parent span for the entire call
-    span = tracer.start_span(f"call_{call_sid}")
-    span.set_attribute("call_sid", call_sid)
-    span.set_attribute("start_time", datetime.datetime.now().isoformat())
+        # Store the span so we can access it later
+        if not hasattr(app, 'call_spans'):
+            app.call_spans = {}
+        app.call_spans[call_sid] = span
+        
+        return span
     
-    # Store the span so we can access it later
-    if not hasattr(app, 'call_spans'):
-        app.call_spans = {}
-    app.call_spans[call_sid] = span
-    
-    return span
+    return None
 
 def end_conversation_tracking(call_sid):
     """End tracking of a complete conversation"""
-    if not hasattr(app, 'call_spans') or call_sid not in app.call_spans:
-        return
+    # Save the complete transcript
+    save_complete_transcript(call_sid)
+    
+    # Also end the span if it exists
+    if hasattr(app, 'call_spans') and call_sid in app.call_spans:
+        span = app.call_spans.pop(call_sid)
+        span.set_attribute("end_time", datetime.datetime.now().isoformat())
+        span.end()
         
-    # Get the span and end it
-    span = app.call_spans.pop(call_sid)
-    span.set_attribute("end_time", datetime.datetime.now().isoformat())
-    span.end()
+    logger.critical(f"CONVERSATION_TRACKING_ENDED: CALL_SID={call_sid}")
 
 async def force_ai_interrupt(openai_ws, message):
     """Force the AI to stop its current train of thought and respond with a new direction"""
@@ -1320,7 +1341,86 @@ async def handle_email_username_input(user_input, state, openai_ws):
     await inject_assistant_message(openai_ws, 
         f"Added '{char_added}'. Your email so far is {spell_out_email(email_so_far)}. "
         f"Please say the next character or 'done' if complete.")
+
+
+# First, let's add a transcript management system to your code
+def initialize_conversation_transcript(call_sid):
+    """Initialize a new transcript record for a call"""
+    if not hasattr(app, 'conversation_transcripts'):
+        app.conversation_transcripts = {}
     
+    # Create a new transcript entry with timestamp
+    app.conversation_transcripts[call_sid] = {
+        "start_time": datetime.datetime.now().isoformat(),
+        "messages": [],
+        "complete": False
+    }
+    logger.info(f"Initialized transcript tracking for call {call_sid}")
+
+def add_to_conversation_transcript(call_sid, direction, text):
+    """Add a message to the conversation transcript"""
+    if not hasattr(app, 'conversation_transcripts') or call_sid not in app.conversation_transcripts:
+        initialize_conversation_transcript(call_sid)
+    
+    # Add the message with timestamp
+    timestamp = datetime.datetime.now().isoformat()
+    app.conversation_transcripts[call_sid]["messages"].append({
+        "timestamp": timestamp,
+        "direction": direction,
+        "text": text
+    })
+
+def save_complete_transcript(call_sid):
+    """Save the complete transcript to Azure Monitor"""
+    if not hasattr(app, 'conversation_transcripts') or call_sid not in app.conversation_transcripts:
+        logger.warning(f"No transcript found for call {call_sid}")
+        return
+    
+    if not tracer:
+        logger.warning("Azure Monitor tracer not available")
+        return
+    
+    transcript = app.conversation_transcripts[call_sid]
+    
+    # Mark transcript as complete
+    transcript["complete"] = True
+    transcript["end_time"] = datetime.datetime.now().isoformat()
+    
+    # Calculate duration
+    start_time = datetime.datetime.fromisoformat(transcript["start_time"])
+    end_time = datetime.datetime.fromisoformat(transcript["end_time"])
+    duration_seconds = (end_time - start_time).total_seconds()
+    
+    # Create a formatted transcript for readability
+    formatted_messages = []
+    for msg in transcript["messages"]:
+        time_str = datetime.datetime.fromisoformat(msg["timestamp"]).strftime("%H:%M:%S")
+        if msg["direction"] == "user":
+            formatted_messages.append(f"[{time_str}] USER: {msg['text']}")
+        else:
+            formatted_messages.append(f"[{time_str}] SYSTEM: {msg['text']}")
+    
+    full_transcript_text = "\n".join(formatted_messages)
+    
+    # Send to Azure Monitor as a single event
+    with tracer.start_as_current_span("complete_conversation_transcript") as span:
+        span.set_attribute("call_sid", call_sid)
+        span.set_attribute("start_time", transcript["start_time"])
+        span.set_attribute("end_time", transcript["end_time"])
+        span.set_attribute("duration_seconds", duration_seconds)
+        span.set_attribute("message_count", len(transcript["messages"]))
+        span.set_attribute("complete_transcript", full_transcript_text)
+        
+        # Also include structured data for potential filtering/analysis
+        for i, msg in enumerate(transcript["messages"]):
+            span.set_attribute(f"message_{i}_direction", msg["direction"])
+            span.set_attribute(f"message_{i}_text", msg["text"])
+            span.set_attribute(f"message_{i}_timestamp", msg["timestamp"])
+    
+    logger.info(f"Saved complete transcript for call {call_sid} to Azure Monitor")
+    
+    # Clean up memory after saving
+    del app.conversation_transcripts[call_sid]
 
 if __name__ == "__main__":
     import uvicorn
