@@ -643,7 +643,16 @@ async def handle_media_stream(websocket: WebSocket):
             if not websocket.client_state == WebSocket.DISCONNECTED:
                 await websocket.close()
             logger.info("WebSocket connection closed")
-
+    except Exception as e:
+                logger.error(f"Critical WebSocket error: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+    finally:
+        # Clean up WebSocket connection
+        if not websocket.client_state == WebSocket.DISCONNECTED:
+            await websocket.close()
+        logger.info("WebSocket connection closed")
+        
 def log_conversation_to_azure(call_sid, direction, text, metadata=None):
     """Send detailed conversation logs to Azure Log Analytics"""
     if not tracer or not call_sid:
