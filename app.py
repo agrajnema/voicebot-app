@@ -598,16 +598,23 @@ async def handle_media_stream(websocket: WebSocket):
                             # Handle audio response
                             elif response_type == "response.audio.delta" and "delta" in response:
                                 try:
+                                    # Decode the base64 audio from OpenAI and re-encode it for Twilio
                                     audio_payload = base64.b64encode(
                                         base64.b64decode(response["delta"])
                                     ).decode("utf-8")
+                                    
+                                    # Create the message structure Twilio expects
                                     audio_delta = {
                                         "event": "media",
                                         "streamSid": stream_sid,
                                         "media": {"payload": audio_payload},
                                     }
-                                    # Convert to JSON string before sending
-                                    await websocket.send_text(json.dumps(audio_delta))
+                                    
+                                    # Convert to JSON string before sending - use send_json() instead of send_text()
+                                    await websocket.send_json(audio_delta)
+                                    
+                                    # Alternative if send_json is not available
+                                    # await websocket.send_text(json.dumps(audio_delta))
                                 except Exception as e:
                                     logger.error(f"Error sending audio to Twilio: {e}")
                             
